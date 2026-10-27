@@ -1,0 +1,169 @@
+name: fpk-ci
+
+# PR / push 到 main / 手动触发：只出包，不发 Release。
+# 关键约束（都是实测出来的，别改）：
+#   · fnpack build 失败时退出码仍为 0 → 必须按输出关键字 "Packing successfully" 判成败
+#   · runner 必须 x86_64（官方 linux-arm64 包实测 404）
+#   · manifest.version 由 scripts/stamp-manifest.sh 注入，仓库里恒为 0.0.0
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read          # 只需要读代码；写权限只给 release 那条流水线
+
+concurrency:
+  group: fpk-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FN_PACK_VERSION: "1.2.3"
+  FN_PACK_SHA256: "54b97fa7b70968c4d05c79840f5daeff508957d0bb2062fdb0376d00d9615c93"
+  FNOS_DIR: "deploy/fnos"
+  APPNAME: "rustfs-fnos"
+  PLATFORM: "x86"
+  # PR 阶段没有真实版本号：用占位版本，与仓库里的 manifest 一致（stamp 变成幂等空操作）
+  PR_VERSION: "0.0.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04          # 必须是 x86_64
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出（带 tag 历史，供 check-image-bump 取基线）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 环境自检（缺东西就立刻失败，别等到打包）
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [ -n "${FN_PACK_VERSION:-}" ] || fail "FN_PACK_VERSION 未设置"
+          [ -n "${FN_PACK_SHA256:-}" ]  || fail "FN_PACK_SHA256 未设置"
+          [ -f "${FNOS_DIR}/manifest" ] || fail "找不到 ${FNOS_DIR}/manifest"
+          [ -f "${FNOS_DIR}/app/docker/docker-compose.yaml" ] || fail "找不到 compose"
+          for s in scripts/preflight.sh scripts/stamp-manifest.sh scripts/check-image-bump.sh; do
+            [ -f "$s" ] || fail "找不到 $s"
+          done
+          echo "runner 架构：$(uname -m)（必须是 x86_64）"
+          [ "$(uname -m)" = "x86_64" ] || fail "本流水线只在 x86_64 runner 上有效"
+
+      - name: 安装 fnpack（锁版本 + 校验 sha256）
+        run: |
+          set -euo pipefail
+          URL="https://static2.fnnas.com/fnpack/fnpack-${FN_PACK_VERSION}-linux-amd64"
+          echo "下载：${URL}"
+          if ! curl -fsSL --max-time 120 --retry 2 "$URL" -o /tmp/fnpack; then
+            echo "::error::下载 fnpack 失败：${URL}"
+            echo "::error::可能是 runner 访问不到 static2.fnnas.com（我们只在局域网验证过下载）。备选方案见 docs/build.md「fnpack 获取」。"
+            exit 1
+          fi
+          echo "${FN_PACK_SHA256}  /tmp/fnpack" | sha256sum -c - || {
+            echo "::error::fnpack sha256 不匹配——下载到的可能不是二进制（例如 HTML 错误页）"
+            head -c 200 /tmp/fnpack | od -c | head -5
+            exit 1
+          }
+          sudo install -m 0755 /tmp/fnpack /usr/local/bin/fnpack
+          fnpack --help | sed -n '1,3p'
+          fnpack --help | grep -q "Version ${FN_PACK_VERSION}" || {
+            echo "::error::fnpack 版本不是 ${FN_PACK_VERSION}"
+            exit 1
+          }
+
+      - name: stamp manifest（PR 用占位版本）
+        run: |
+          set -euo pipefail
+          bash scripts/stamp-manifest.sh "${FNOS_DIR}" \
+            --version "${PR_VERSION}" --platform "${PLATFORM}"
+
+      - name: 结构预检（必需文件 / manifest 正则 / JSON / 图标尺寸 / 硬编码）
+        run: |
+          set -euo pipefail
+          bash scripts/preflight.sh "${FNOS_DIR}"
+
+      - name: 镜像引用检查（PR 阶段无发布基线 → 只拦 :latest 之类硬错误）
+        run: |
+          set -euo pipefail
+          # PR 阶段没有「上一版」，版本↔镜像的同步变化断言没有意义（版本恒 0.0.0）。
+          # 这里只跑格式类检查；真正的版本↔镜像闸在 release 流水线里用 --baseline-git 跑。
+          bash scripts/check-image-bump.sh "${FNOS_DIR}" --allow-no-baseline
+
+      - name: fnpack build（按输出关键字判定成败）
+        run: |
+          set -euo pipefail
+          cd "${FNOS_DIR}"
+          out="$(fnpack build 2>&1)"; rc=$?
+          printf '%s\n' "${out}"
+          # 注意：失败时 rc 也可能是 0，所以只能看输出
+          if ! printf '%s' "${out}" | grep -q "Packing successfully"; then
+            echo "::error::fnpack build 失败（退出码 ${rc}，但按关键字判定为失败）"
+            exit 1
+          fi
+          fpkg="${APPNAME}.fpk"
+          [ -s "${fpkg}" ] || { echo "::error::没有产物 ${fpkg} 或大小为 0"; exit 1; }
+          ls -l "${fpkg}"
+
+      - name: 产物体检（white-list + 回读 version）
+        run: |
+          set -euo pipefail
+          cd "${FNOS_DIR}"
+          fpk="${APPNAME}.fpk"
+          tar -tzf "${fpk}" | sort > /tmp/fpk.list
+
+          # ① 必含项
+          for f in manifest ICON.PNG ICON_256.PNG app.tgz cmd config wizard; do
+            grep -qx "$f" /tmp/fpk.list || { echo "::error::包内缺少 $f"; exit 1; }
+          done
+          for f in cmd/main cmd/install_init cmd/install_callback \
+                   cmd/upgrade_init cmd/upgrade_callback \
+                   cmd/uninstall_init cmd/uninstall_callback; do
+            grep -qx "$f" /tmp/fpk.list || { echo "::error::包内缺少 $f"; exit 1; }
+          done
+
+          # ② 禁止项（噪音 / 密钥）
+          if grep -Eq '(^|/)\.DS_Store$|\.bak$|(^|/)config\.env$|(^|/)\.env$|(^|/)\.git/' /tmp/fpk.list; then
+            echo "::error::包内出现禁止文件："
+            grep -E '(^|/)\.DS_Store$|\.bak$|(^|/)config\.env$|(^|/)\.env$|(^|/)\.git/' /tmp/fpk.list
+            exit 1
+          fi
+
+          # ③ 回读 manifest.version（防 stamp 静默失效）
+          tar -xzOf "${fpk}" manifest > /tmp/packed.manifest
+          got="$(awk -F= '/^[[:space:]]*version[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' /tmp/packed.manifest)"
+          [ "${got}" = "${PR_VERSION}" ] || {
+            echo "::error::包内 manifest.version=${got}，期望 ${PR_VERSION}（stamp 可能没生效）"
+            grep -n '^version' /tmp/packed.manifest || true
+            exit 1
+          }
+          echo "包内 version=${got} ✓"
+
+          # ④ 包内不得出现硬编码宿主路径（compose 已在 preflight 查过，这里查一次整体）
+          if tar -xzOf "${fpk}" app.tgz | tar -xzOf - docker/docker-compose.yaml 2>/dev/null | grep -q '/var/apps/'; then
+            echo "::error::compose 里出现 /var/apps 硬编码"
+            exit 1
+          fi
+
+      - name: 上传 artifact（供人工下载与后续排查）
+        uses: actions/upload-artifact@v4
+        with:
+          name: fpk-${{ github.sha }}
+          path: ${{ env.FNOS_DIR }}/${{ env.APPNAME }}.fpk
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "### fpk-ci 结果"
+            echo ""
+            echo "- commit: ${GITHUB_SHA}"
+            echo "- fnpack: ${FN_PACK_VERSION}（sha256 已校验）"
+            echo "- 产物: ${FNOS_DIR}/${APPNAME}.fpk"
+            echo "- 判定依据: 输出关键字 \`Packing successfully\`（不是退出码）"
+          } >> "${GITHUB_STEP_SUMMARY}"

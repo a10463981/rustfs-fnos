@@ -1,0 +1,76 @@
+# 说明：git 不支持「模式 + 行尾注释」的写法。
+# 本文件一律把注释单独占一行，紧跟其下才是模式。
+
+# ---- 构建产物 ----
+# 打包产物：由 CI/本地构建生成，发布走 Release，不入库
+*.fpk
+# 存档目录，属于输出而非源码
+dist/
+# Fpk Studio 等可视化工具生成的构建目录：含各架构工作副本与打包偏好，每次打包会被改写
+building/
+# 校验值清单：必须与产物同源生成，入库会与实际二进制脱节
+SHA256SUMS
+
+# ---- 凭据与本地环境 ----
+# 通用环境变量文件，最容易误放 token
+.env
+# 各类环境变体（.env.local / .env.prod 等）
+.env.*
+# 安装/测试时用的向导变量文件，可能含 Access Key、Secret Key、管理员口令
+config.env
+# 证书/私钥，绝不入库
+*.pem
+# 私钥或密钥材料
+*.key
+# 证书库，通常含私钥
+*.p12
+# 同上（Windows 格式）
+*.pfx
+# SSH 私钥及其变体
+id_rsa*
+# 同上，现代默认算法
+id_ed25519*
+# 明文保存的 FTP/HTTP 凭据
+.netrc
+# git 明文凭据存储（由 credential.helper store 生成，应避免使用该 helper）
+.git-credentials
+# 各类云服务/服务账号凭据文件
+credentials*.json
+
+# ---- 日志与临时文件 ----
+# 运行日志：可能包含数据路径、镜像地址，甚至误写的敏感信息
+*.log
+# 轮转后的日志（app.log.1 等）
+*.log.*
+# 本地临时目录
+tmp/
+# 临时文件
+*.tmp
+# vim 交换文件
+*.swp
+# 编辑器备份文件（会随包被打进 fpk 的 cmd/，属于脏文件）
+*~
+
+# ---- 系统与编辑器噪音 ----
+# macOS 目录元数据：会被原样打进 fpk 的 cmd/ 与 wizard/，属于评审常见脏点
+.DS_Store
+# Windows 缩略图缓存，同上
+Thumbs.db
+# JetBrains 工程配置，个人化
+.idea/
+# VSCode 工作区配置，个人化
+.vscode/
+
+# ---- 本地工具链 ----
+# 打包工具二进制：版本由 tools.lock 记录，不入库（若确需 vendored，请单独评审并附 sha256）
+fnpack
+# 下载下来的工具文件，同上
+fnpack-*
+# 本地下载的工具目录（约定目录，避免与源码混放）
+tools/
+
+# ---- 其他 ----
+# 若将来引入前端构建依赖，默认不入库
+node_modules/
+# 手工备份文件：曾被原样打进 fpk 的 cmd/，属于必须拦住的脏文件
+*.bak

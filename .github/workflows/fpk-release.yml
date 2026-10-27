@@ -1,0 +1,199 @@
+name: fpk-release
+
+# tag 触发：出包 + 建 Release（先 draft，资产齐了再 publish）。
+# 版本唯一真源 = tag：v1.2.3 → manifest.version=1.2.3；v1.2.3-1 → 1.2.3-1 且 Release 标 prerelease。
+# 只接受 vX.Y.Z 与 vX.Y.Z-N（N 为整数）；其它形态直接失败。
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write          # 创建 Release / 上传资产需要它（文档原文：contents: write allows the action to create a release）
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # 发布不允许被后一个 run 取消
+
+env:
+  FN_PACK_VERSION: "1.2.3"
+  FN_PACK_SHA256: "54b97fa7b70968c4d05c79840f5daeff508957d0bb2062fdb0376d00d9615c93"
+  FNOS_DIR: "deploy/fnos"
+  APPNAME: "rustfs-fnos"
+  PLATFORM: "x86"
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04          # x86_64
+    timeout-minutes: 30
+    environment: release           # 环境级审批（保护规则的具体配置项名需在仓库设置里确认，见 docs/build.md「需核实」）
+    steps:
+      - name: 检出（必须带完整历史与 tag）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 校验 tag 形态（不合法直接失败）
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=${TAG}"
+          if ! printf '%s' "${TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+)?$'; then
+            echo "::error::tag 形态非法：${TAG}"
+            echo "::error::只接受 vX.Y.Z 或 vX.Y.Z-<整数>（例：v1.0.4 / v1.0.4-1）。带 -beta/-rc 这类后缀会被 fnpack 拒绝。"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          case "${VERSION}" in
+            *-*) echo "PRERELEASE=true"  >> "${GITHUB_ENV}" ;;
+            *)   echo "PRERELEASE=false" >> "${GITHUB_ENV}" ;;
+          esac
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "FPK_ASSET=${APPNAME}-${VERSION}-${PLATFORM}.fpk" >> "${GITHUB_ENV}"
+
+      - name: 找上一个发布 tag（作为版本↔镜像断言的基线）
+        run: |
+          set -euo pipefail
+          if PREV="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null)"; then
+            echo "PREV_TAG=${PREV}" >> "${GITHUB_ENV}"
+            echo "基线 tag：${PREV}"
+          else
+            echo "PREV_TAG=" >> "${GITHUB_ENV}"
+            echo "::warning::没有找到上一个 tag（可能是首个发布），版本↔镜像断言将降级为 WARN"
+          fi
+
+      - name: 安装 fnpack（锁版本 + 校验 sha256）
+        run: |
+          set -euo pipefail
+          URL="https://static2.fnnas.com/fnpack/fnpack-${FN_PACK_VERSION}-linux-amd64"
+          if ! curl -fsSL --max-time 120 --retry 2 "$URL" -o /tmp/fnpack; then
+            echo "::error::下载 fnpack 失败：${URL}（runner 可能访问不到该域名）"
+            exit 1
+          fi
+          echo "${FN_PACK_SHA256}  /tmp/fnpack" | sha256sum -c - || { echo "::error::fnpack sha256 校验失败"; exit 1; }
+          sudo install -m 0755 /tmp/fnpack /usr/local/bin/fnpack
+          fnpack --help | grep -q "Version ${FN_PACK_VERSION}" || { echo "::error::fnpack 版本不符"; exit 1; }
+
+      - name: stamp manifest（tag → manifest.version）
+        run: |
+          set -euo pipefail
+          # changelog 用 tag 的注释（annotated tag）首行；没有就留空不写
+          CHANGELOG="$(git for-each-ref --format='%(contents:subject)' "refs/tags/${GITHUB_REF_NAME}" 2>/dev/null | head -n1 || true)"
+          if [ -n "${CHANGELOG}" ] && [ "${CHANGELOG}" != "${GITHUB_REF_NAME}" ]; then
+            bash scripts/stamp-manifest.sh "${FNOS_DIR}" \
+              --version "${VERSION}" --platform "${PLATFORM}" --changelog "${CHANGELOG}"
+          else
+            bash scripts/stamp-manifest.sh "${FNOS_DIR}" --version "${VERSION}" --platform "${PLATFORM}"
+          fi
+
+      - name: 结构预检
+        run: bash scripts/preflight.sh "${FNOS_DIR}"
+
+      - name: 版本↔镜像同步变化（发布前的硬闸）
+        run: |
+          set -euo pipefail
+          if [ -n "${PREV_TAG:-}" ]; then
+            # 上一版的项目目录从 git 里取，比的是「上一版 manifest.version / image」与「本次 stamp 后」
+            bash scripts/check-image-bump.sh "${FNOS_DIR}" --baseline-git "${PREV_TAG}"
+          else
+            echo "::warning::首个发布，无基线；只做镜像引用格式检查"
+            bash scripts/check-image-bump.sh "${FNOS_DIR}" --allow-no-baseline
+          fi
+
+      - name: fnpack build（按输出关键字判定成败）
+        run: |
+          set -euo pipefail
+          cd "${FNOS_DIR}"
+          out="$(fnpack build 2>&1)"; rc=$?
+          printf '%s\n' "${out}"
+          if ! printf '%s' "${out}" | grep -q "Packing successfully"; then
+            echo "::error::fnpack build 失败（退出码 ${rc}，按关键字判定为失败）"
+            exit 1
+          fi
+          [ -s "${APPNAME}.fpk" ] || { echo "::error::没有产物"; exit 1; }
+
+      - name: 产物体检 + 回读 version
+        run: |
+          set -euo pipefail
+          cd "${FNOS_DIR}"
+          tar -tzf "${APPNAME}.fpk" | sort > /tmp/fpk.list
+          for f in manifest ICON.PNG ICON_256.PNG app.tgz cmd config wizard; do
+            grep -qx "$f" /tmp/fpk.list || { echo "::error::包内缺少 $f"; exit 1; }
+          done
+          if grep -Eq '(^|/)\.DS_Store$|\.bak$|(^|/)config\.env$|(^|/)\.env$' /tmp/fpk.list; then
+            echo "::error::包内出现禁止文件"; grep -E '(^|/)\.DS_Store$|\.bak$|(^|/)config\.env$' /tmp/fpk.list; exit 1
+          fi
+          tar -xzOf "${APPNAME}.fpk" manifest > /tmp/packed.manifest
+          got="$(awk -F= '/^[[:space:]]*version[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' /tmp/packed.manifest)"
+          [ "${got}" = "${VERSION}" ] || { echo "::error::包内 version=${got}，期望 ${VERSION}"; exit 1; }
+          echo "包内 version=${got} ✓"
+
+      - name: 重命名 + 生成 SHA256SUMS 与 build-info.json
+        run: |
+          set -euo pipefail
+          cd "${FNOS_DIR}"
+          mv "${APPNAME}.fpk" "${FPK_ASSET}"
+          sha256sum "${FPK_ASSET}" > SHA256SUMS
+          cat SHA256SUMS
+
+          IMAGE_REF="$(awk -F'image:' '/^[[:space:]]*image:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' app/docker/docker-compose.yaml)"
+          # image id 需要 pull 之后才有；CI 不在发布流水线里拉 300MB 镜像，
+          # 这里只记 digest（docker manifest inspect，轻量），image_id 留 null 并注明
+          IMAGE_DIGEST="$(docker manifest inspect "${IMAGE_REF}" 2>/dev/null \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("config",{}).get("digest",""))' 2>/dev/null || true)"
+          if [ -z "${IMAGE_DIGEST}" ]; then
+            IMAGE_DIGEST="$(docker buildx imagetools inspect "${IMAGE_REF}" 2>/dev/null | awk '/^Digest:/{print $2; exit}' || true)"
+          fi
+
+          # build-info.json 由仓内脚本生成（便于本地复跑同一份逻辑）
+          python3 ../../scripts/make-build-info.py \
+            --asset "${FPK_ASSET}" \
+            --image-ref "${IMAGE_REF}" \
+            --image-digest "${IMAGE_DIGEST:-}" \
+            --out build-info.json
+          cat build-info.json
+
+      - name: 创建 draft Release 并上传资产
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "${FNOS_DIR}"
+          # 先 draft：上传中断不会留下"看起来已发布但缺资产"的 Release
+          # Release 正文模板用 .github/RELEASE_TEMPLATE.md（有人维护就用它，没有就自动生成 notes）
+          NOTES_ARGS=(--generate-notes)
+          if [ -f "../../.github/RELEASE_TEMPLATE.md" ]; then
+            NOTES_ARGS=(--notes-file "../../.github/RELEASE_TEMPLATE.md")
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --draft \
+            --title "${APPNAME} ${VERSION}" \
+            "${NOTES_ARGS[@]}" \
+            "${FPK_ASSET}" SHA256SUMS build-info.json
+          # 复核资产
+          gh release view "${GITHUB_REF_NAME}" --json assets \
+            --jq '.assets[] | "\(.name)\t\(.size)"'
+
+      - name: 发布（prerelease 判定 + 解除 draft）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${PRERELEASE}" = "true" ]; then
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --prerelease --latest=false
+          else
+            gh release edit "${GITHUB_REF_NAME}" --draft=false --latest
+          fi
+          gh release view "${GITHUB_REF_NAME}" --json tagName,isDraft,isPrerelease,assets
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "### fpk-release"
+            echo ""
+            echo "- tag: ${GITHUB_REF_NAME} → version ${VERSION}（prerelease=${PRERELEASE}）"
+            echo "- 资产: ${FPK_ASSET} / SHA256SUMS / build-info.json"
+            echo "- 基线: ${PREV_TAG:-无}"
+            echo "- 版本↔镜像闸: $([ -n "${PREV_TAG:-}" ] && echo "已执行（--baseline-git）" || echo "跳过（首个发布）")"
+          } >> "${GITHUB_STEP_SUMMARY}"
