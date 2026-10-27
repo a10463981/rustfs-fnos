@@ -11,7 +11,15 @@ services:
     restart: unless-stopped
     stop_grace_period: 30s
     ports:
-      - "${TRIM_SERVICE_PORT:-9200}:9000"
+      # 端口的两道保险（改前必读）：
+      #   ① 插值：平台确实会把 wizard_* 传给 compose（真机证据：控制台行插值成 9301 成功），
+      #      所以这里直接吃 wizard_api_port / wizard_console_port —— 首装平台「先按模板拉起容器」那一次也能对。
+      #   ② 渲染：cmd/install_callback 与 config_callback 会把用户选的端口**写成字面值**（如 "9300:9000"），
+      #      并在写完后强制重建容器，让「容器实际发布」=「compose 声明」=「settings.env」。
+      # 谁优先：**以渲染后的字面值为准**（compose up 时读到的文件内容才是容器发布端口的唯一决定因素）；
+      #   插值只在「文件还没被渲染」的那一刻起作用（首装首次创建）。两者都由同一个真源驱动：settings.env 的
+      #   API_PORT / CONSOLE_PORT，正常情况下永远一致。
+      - "${wizard_api_port:-9200}:9000"
       - "${wizard_console_port:-9201}:9001"
     volumes:
       # 注意：这一行永远指向 ${TRIM_PKGVAR}/<subdir>，不要改成用户填的路径。
@@ -26,7 +34,19 @@ services:
     environment:
       RUSTFS_ADDRESS: ":9000"
       RUSTFS_CONSOLE_ADDRESS: ":9001"
+      # 把控制台挂到平台网关前缀下（上游官方开关，默认 /rustfs/console）。
+      # 真机实测：设成这个前缀后，页面与 35 条 _next 资源路径一起搬过去，不需要任何响应体改写；
+      # 平台转发时**保留**该前缀（nginx 收到的请求行就是 GET /app/rustfs-fnos/…），所以这里必须与
+      # app/ui/config 的 gatewayPrefix 一致 —— 改一处就要改另一处。
+      RUSTFS_CONSOLE_PREFIX: "/app/rustfs-fnos"
       RUSTFS_CONSOLE_ENABLE: "${wizard_console_enable:-true}"
+      # 控制台是纯前端：窗口内打开时，浏览器会从平台 origin（http://<NAS>:5666）
+      # 直接向 S3 API 端口发跨源 SigV4 请求；S3 侧不回 CORS 头 → 登录必失败（真机已验证：
+      # 预检 OPTIONS 虽 200，但一个 access-control-* 都没有，浏览器直接丢弃结果，
+      # 网关日志里连一条 POST 都看不到 —— 那条请求根本不经过我们）。
+      # 精确源模式会额外返回 allow-credentials，比 * 更安全；多个地址用逗号分隔。
+      # 向导留空 → 回退 *（`:-` 对「未设置」和「空串」都生效，所以空值也安全）。
+      RUSTFS_CORS_ALLOWED_ORIGINS: "${wizard_cors_origins:-*}"
       RUSTFS_OBS_LOGGER_LEVEL: "${wizard_log_level:-error}"
       RUSTFS_OBS_LOG_DIRECTORY: "/var/log/rustfs/"
       # 凭据只走文件，不走 env（env 在 docker inspect 里明文可见）
@@ -45,3 +65,38 @@ services:
       timeout: 5s
       retries: 3
       start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # gateway：把平台 iframe 入口要的 unix socket 接到 RustFS 控制台端口
+  #
+  # 为什么需要它：平台「窗口内打开」加载的是 /app/<应用名>，由平台网关转发到**应用自己的 app.sock**。
+  # RustFS 只监听 TCP，不提供 unix socket，所以用一个最小 nginx 在 <应用根>/app.sock 上监听并反代。
+  #
+  # 三个坑，都在真机上踩过，别改：
+  #   1) upstream 必须写 compose 服务名 `rustfs:9001`；写 127.0.0.1 会 502（两个容器不共享 localhost）。
+  #   2) **tmpfs 两行不能少**：nginx 以非 root（TRIM_UID）运行时，要在 /var/cache/nginx 建临时目录、
+  #      在 /var/run 写 pid；权限不足会 [emerg] mkdir failed 直接退出 → socket 永不生成 → 平台 502。
+  #      真机复现：删掉这两行 → gateway 无限重启；加上 → Up、socket 生成、via-socket 200。
+  #   3) socket 必须落在 ${TRIM_APPDEST}/app.sock（gatewaySocket 相对「应用根」，与 fpkstudio /
+  #      trim.preview 两个真样本一致），所以把 ${TRIM_APPDEST} 挂到 /sock。
+  #
+  # 它挂了只影响「窗口内打开」，S3 API 与控制台直连照常可用；main status 对 socket 缺失只 WARN。
+  # ---------------------------------------------------------------------------
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: rustfs-fnos-gateway
+    user: "${TRIM_UID:?TRIM_UID missing}:${TRIM_GID:?TRIM_GID missing}"
+    tmpfs:
+      - /var/cache/nginx:rw,size=16m,mode=777
+      - /var/run:rw,size=4m,mode=777
+    restart: unless-stopped
+    depends_on:
+      - rustfs
+    volumes:
+      - "${TRIM_APPDEST:?TRIM_APPDEST missing}:/sock"
+      - "${TRIM_APPDEST}/docker/gateway.conf:/etc/nginx/conf.d/default.conf:ro"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"

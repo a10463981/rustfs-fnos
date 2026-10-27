@@ -58,6 +58,19 @@ compose_image() {
   awk -F'image:' '/^[[:space:]]*image:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "${COMPOSE_FILE}" 2>/dev/null
 }
 
+# API 端口的唯一真源是 settings.env 的 API_PORT（用户可能在向导里改过）：
+#   优先级 API_PORT → TRIM_SERVICE_PORT → 9200。
+# 不能只用 TRIM_SERVICE_PORT —— 那是 manifest.service_port 的静态值，用户改成 9300 后它就过时了。
+api_port_resolved() {
+  local p=""
+  if [ -r "${SETTINGS}" ]; then
+    p="$(awk -F= '/^[[:space:]]*API_PORT[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "${SETTINGS}" 2>/dev/null)"
+  fi
+  [ -n "${p}" ] || p="${TRIM_SERVICE_PORT:-9200}"
+  case "${p}" in ''|*[!0-9]*) p=9200 ;; esac
+  printf '%s' "${p}"
+}
+
 read_settings() {
   if [ -r "${SETTINGS}" ]; then
     # shellcheck disable=SC1090
@@ -153,6 +166,7 @@ rollback_or_fail() {
 
 read_settings
 read_pending
+API_PORT="$(api_port_resolved)"
 
 case "$1" in
   start)
@@ -223,6 +237,14 @@ case "$1" in
   status)
     # 三态：0 运行中（含"已就绪但待校验"）/ 1 故障 / 3 未运行
     container_running || exit 3
+
+    # 窗口内打开用的 unix socket 是否存在 —— 只提示，**不参与成败判定**。
+    # 理由：socket 由 gateway 容器提供，它抖动不该让整个应用显示异常；
+    # 它只影响「点桌面图标窗口内打开」，S3 API 与控制台直连都不受影响。
+    if [ ! -S "${TRIM_APPDEST}/app.sock" ]; then
+      warn "窗口内打开用的 socket 不存在（${TRIM_APPDEST}/app.sock）：桌面图标可能打不开控制台，但服务本身可直连。"
+      warn "排查：docker logs rustfs-fnos-gateway；docker ps --filter name=rustfs-fnos-gateway"
+    fi
 
     declared_ref="$(compose_image)"
     actual_ref="$(container_image_ref)"

@@ -3,10 +3,12 @@
         "rustfs-fnos.console": {
             "title": "RustFS 控制台",
             "icon": "images/icon_{0}.png",
-            "type": "url",
-            "protocol": "http",
-            "port": "${wizard_console_port}",
-            "url": "/rustfs/console/",
+            "type": "iframe",
+            "protocol": "",
+            "gatewayPrefix": "/app/rustfs-fnos",
+            "gatewaySocket": "app.sock",
+            "port": "",
+            "url": "/app/rustfs-fnos",
             "allUsers": false,
             "control": {
                 "accessPerm": "readonly"
