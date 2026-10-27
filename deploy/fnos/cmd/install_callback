@@ -1,0 +1,513 @@
+#!/bin/bash
+
+APP_NAME=rustfs-fnos
+CONTAINER=rustfs-fnos
+COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+CRED_DIR="${CFG_DIR}/credentials"
+SETTINGS="${CFG_DIR}/settings.env"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+API_PORT="${TRIM_SERVICE_PORT:-9200}"
+
+compose() { docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" "$@"; }
+
+say() { echo "[${APP_NAME}] $*"; }
+
+# 告警：不中断安装（v3 起用于"镜像预热失败"等可降级情形）
+warn() {
+  { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}"; } 2>/dev/null || true
+  echo "[${APP_NAME}] WARN: $*" >&2
+}
+
+# 失败：既要让管理员在终端看见，也要写进 TRIM_TEMP_LOGFILE 让应用中心显示原因
+fail() {
+  { echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}"; } 2>/dev/null || true
+  echo "[${APP_NAME}] ERROR: $*" >&2
+  exit 1
+}
+
+trace() {
+  { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log"; } 2>/dev/null || true
+}
+
+# 宿主侧探针（不依赖镜像内工具）；200 才算就绪
+probe_ready() {
+  local url="http://127.0.0.1:$1/health/ready"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 5 "$url" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q -T 5 -O /dev/null "$url" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  return 1
+}
+
+wait_ready() {
+  local port="$1" timeout="${2:-180}" waited=0
+  while [ "${waited}" -lt "${timeout}" ]; do
+    probe_ready "${port}" && return 0
+    sleep 3
+    waited=$((waited + 3))
+  done
+  return 1
+}
+
+read_settings() {
+  if [ -r "${SETTINGS}" ]; then
+    # shellcheck disable=SC1090
+    . "${SETTINGS}"
+  fi
+}
+
+normalize_data_dir() {
+  local d="$1"
+  d="$(printf '%s' "${d}" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [ -z "${d}" ] && { printf ''; return 0; }
+  while [ "${#d}" -gt 1 ] && [ "${d%/}" != "${d}" ]; do d="${d%/}"; done
+  printf '%s' "${d}"
+}
+
+# >>> BEGIN: writable-probe（本段在 install_init / config_init / install_callback / config_callback 中必须逐字相同；preflight §5c 会比对）
+# 以「容器运行用户」（${TRIM_UID}:${TRIM_GID}）身份真实写一个探针文件，判断目录是否真的可写。
+#
+# 为什么不看属主：fnOS 在卷上挂了一层 TrimACL（挂载项 trimacl + system.trim_acl xattr），
+# 它会给包用户 uid 单独挂一条 rwxpdDaAeEc 的 ACE。真机实测：目录属主是 admin(1000)、
+# 包用户 uid 996 也能在里面建文件（与该用户是否在 Users 组无关）。旧代码用「属主 UID 比对」
+# 把这种目录判成不可写，逼用户去 sudo chown —— 其实根本不需要。
+#
+# 为什么 root 必须降权：root 写任何目录都成功，用 root 探测等于没检查。
+# 统一的「属主」显示：用户名:组名（UID n）；解析不到用户名时退回 UID n。
+# 四个脚本共用这一份，避免出现「UID 1000」与「admin:Users」两种写法（真机第十一轮指出）。
+owner_desc() { # $1=路径
+  local p="$1" uname_ u gname_ n
+  n="$(stat -c '%u' "${p}" 2>/dev/null || echo '')"
+  uname_="$(stat -c '%U' "${p}" 2>/dev/null || echo '')"
+  gname_="$(stat -c '%G' "${p}" 2>/dev/null || echo '')"
+  if [ -n "${n}" ] && [ -n "${uname_}" ] && [ "${uname_}" != "UNKNOWN" ] && [ -n "${gname_}" ] && [ "${gname_}" != "UNKNOWN" ]; then
+    printf '%s:%s（UID %s）' "${uname_}" "${gname_}" "${n}"
+  elif [ -n "${n}" ]; then
+    printf 'UID %s' "${n}"
+  else
+    printf '未知'
+  fi
+}
+
+# 数据目录「操作意图」归一：向导没有控件联动，所以必须靠这份规则消歧。
+#   mode=default   → 恢复默认位置（忽略文本框）
+#   mode=custom    → 必须填文本框，否则报错
+#   mode=keep / 空 → 不改；但若文本框非空，按 custom 处理（兼容只填路径的老习惯）
+resolve_data_request() { # $1=mode $2=text → "<action>|<path>"，action=keep|custom|default|error
+  local mode="${1:-keep}" text="${2:-}"
+  text="$(printf '%s' "${text}" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  case "${mode}" in
+    default) printf 'default|' ;;
+    custom)
+      if [ -z "${text}" ]; then
+        printf 'error|选择了「改到指定目录」但没有填写路径'
+      else
+        printf 'custom|%s' "${text}"
+      fi ;;
+    keep|'')
+      if [ -n "${text}" ]; then printf 'custom|%s' "${text}"; else printf 'keep|'; fi ;;
+    *) printf 'error|未知的数据目录操作：%s' "${mode}" ;;
+  esac
+}
+
+# DATA_DIR_MODE 由事实派生（不再由「是否来自向导」决定）：
+#   挂载点 ${VAR_DIR}/<subdir> 是符号链接 → custom（数据物理上在别处）
+#   不是链接且实际路径就是它      → default
+# 注意：不能直接 readlink -f 两边再比 —— 自定义目录时链接会解析到同一个目标，
+# 那样会永远判成 default（本轮自测就踩到这一下）。
+derive_data_mode() { # $1=实际数据目录 $2=应用目录里的挂载点（var/<subdir>）
+  local d="$1" l="$2"
+  [ -L "${l}" ] && { printf 'custom'; return 0; }
+  if [ "$(readlink -f "${d}" 2>/dev/null || echo "${d}")" = "$(readlink -f "${l}" 2>/dev/null || echo "${l}")" ]; then
+    printf 'default'
+  else
+    printf 'custom'
+  fi
+}
+
+# 把「曾经被改名保留下来的旧默认库」告诉用户（${VAR_DIR}/<subdir>.old-*）。
+# 只在「目标回到默认位置」时调用：那时应用用的是新建的空库，用户会以为数据丢了，
+# 而旧库其实完整保留着（默认→自定义时被改名，不是删除）。
+report_stale_default_data() { # $1=VAR_DIR $2=subdir 名 $3=当前默认目录
+  local var="$1" sub="$2" cur="$3" d sz cnt uid gid found=0
+  uid="${TRIM_UID:-$(id -u 2>/dev/null)}"
+  gid="${TRIM_GID:-$(id -g 2>/dev/null)}"
+  for d in "${var}/${sub}".old-*; do
+    [ -d "${d}" ] || continue
+    found=1
+    sz="$(du -sh "${d}" 2>/dev/null | awk '{print $1}')"
+    cnt="$(find "${d}" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+    say "旧数据目录（完整保留，未删除）：${d}　体积 ${sz:-?}，条目 ${cnt}"
+  done
+  [ "${found}" = "1" ] || return 0
+  say "说明：这些是你之前「切到自定义目录」时，原来的默认数据被整体改名保留在这里（一个字节都没删）。"
+  say "      现在应用用的是新建的空数据目录 ${cur}，所以原来建的桶/对象在这里看不到。"
+  say "      要搬回来：先在应用中心「停止」应用，再复制粘贴执行下面几条——"
+  for d in "${var}/${sub}".old-*; do
+    [ -d "${d}" ] || continue
+    say "  sudo cp -a \"${d}/.\" \"${cur}/\""
+  done
+  say "  sudo chown -R ${uid}:${gid} \"${cur}\""
+  say "      （源写成「旧目录/.」表示把里面的内容复制进目标目录，不会多套一层子目录；同名文件以旧库为准覆盖）"
+  say "      搬完在应用中心「停止 → 启动」；确认数据都在后，可以自行删除 ${var}/${sub}.old-* 目录。"
+  return 0
+}
+
+probe_writable() { # $1=已存在的目录；0=可写 1=不可写
+  local dir="$1" p cur_uid target_uid target_gid
+  [ -d "${dir}" ] || return 1
+  cur_uid="$(id -u 2>/dev/null || echo '?')"
+  target_uid="${TRIM_UID:-${cur_uid}}"
+  target_gid="${TRIM_GID:-$(id -g 2>/dev/null || echo "${cur_uid}")}"
+  p="${dir}/.rustfs-write-probe.$$"
+
+  # 情况①：当前是 root 且目标用户不是 root → 降权后再写（否则恒真）
+  if [ "${cur_uid}" = "0" ] && [ "${target_uid}" != "0" ]; then
+    if command -v setpriv >/dev/null 2>&1; then
+      trace "write-probe: cur_uid=0 → 降权至 ${target_uid}:${target_gid} 后探测 ${dir}"
+      if setpriv --reuid "${target_uid}" --regid "${target_gid}" --clear-groups \
+           sh -c 'umask 022; : > "$1"' _ "${p}" 2>/dev/null; then
+        rm -f "${p}" 2>/dev/null || true
+        return 0
+      fi
+      rm -f "${p}" 2>/dev/null || true
+      return 1
+    fi
+    warn "环境里没有 setpriv，无法以 UID ${target_uid} 降权探测写权限；按可写处理（若实际不可写，会在启动阶段暴露）。"
+    return 0
+  fi
+
+  # 情况②：当前身份与容器用户不一致且没有 root 权限 → 只能以当前身份探测，并明确告知
+  if [ "${cur_uid}" != "${target_uid}" ]; then
+    warn "当前身份 UID ${cur_uid} 与容器运行用户 UID ${target_uid} 不同，且无 root 权限降权；写探测以当前身份进行。"
+  fi
+
+  trace "write-probe: 以 uid=$(id -u) 直接探测 ${dir}（未降权）"
+  if ( umask 022; : > "${p}" ) 2>/dev/null; then
+    rm -f "${p}" 2>/dev/null || true
+    return 0
+  fi
+  rm -f "${p}" 2>/dev/null || true
+  return 1
+}
+# <<< END: writable-probe
+
+# 安装后：建数据目录（可自定义）、写凭据、写 settings.env。必须幂等（重装/修复会再跑一遍）
+trace "install_callback begin"
+[ -f "${COMPOSE_FILE}" ] || fail "compose 文件缺失：${COMPOSE_FILE}"
+
+# 上次的配置值（只读，不 source，避免副作用）：
+#   · DATA_DIR —— 重装且用户没指定时沿用它，绝不能悄悄回到默认
+#   · CRED_SOURCE —— 本次没改凭据时保留原值，不要覆盖成 keep
+old_cred_source="$(awk -F= '/^[[:space:]]*CRED_SOURCE[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "${SETTINGS}" 2>/dev/null)"
+old_data_dir="$(awk -F= '/^[[:space:]]*DATA_DIR[[:space:]]*=/{sub(/^[^=]*=[[:space:]]*/,""); sub(/[[:space:]]+$/,""); print; exit}' "${SETTINGS}" 2>/dev/null)"
+
+# ---------------------------------------------------------------------------
+# 1) 数据目录
+#
+# 为什么用「固定挂载点 + 符号链接」而不是让 compose 直接读设置：
+#   compose 的变量只有应用中心注入的那批（TRIM_*/wizard_*），它不会去 source 我们的
+#   settings.env；一旦某个变量为空，卷就会变成 ":/data" 或 "/data"，容器直接起不来。
+#   所以 compose 的卷始终保持 ${TRIM_PKGVAR}/<subdir> 不变，物理位置由这个符号链接决定：
+#     · 换目录 = 换链接，秒级完成，不搬数据
+#     · 默认位置 = 真实目录，行为与老版本完全一致
+# ---------------------------------------------------------------------------
+data_subdir="${wizard_data_subdir:-data}"
+case "${data_subdir}" in
+  ''|*[!a-z0-9_-]*) fail "数据子目录名非法：${data_subdir}（只允许小写字母、数字、下划线、连字符）" ;;
+esac
+
+mkdir -p "${VAR_DIR}/logs" "${CRED_DIR}" || fail "创建目录失败：${VAR_DIR}。请检查存储空间是否可写。"
+chmod 700 "${CRED_DIR}" 2>/dev/null || true
+
+link_path="${VAR_DIR}/${data_subdir}"
+# 归一「本次要做的事」：keep / custom / default（规则见 resolve_data_request）
+req="$(resolve_data_request "${wizard_data_mode:-keep}" "${wizard_data_dir:-}")"
+req_action="${req%%|*}"
+req_path="${req#*|}"
+case "${req_action}" in
+  error) fail "数据目录设置无效：${req_path}
+  处理：选择「改到指定目录」时，请在输入框里填完整绝对路径（例如 /vol1/my-rustfs-data）；只改开关不填路径会被拒绝。" ;;
+esac
+if [ "${req_action}" = "default" ]; then
+  data_dir=""
+elif [ "${req_action}" = "custom" ]; then
+  data_dir="$(normalize_data_dir "${req_path}")"
+else
+  # keep / 未指定：沿用上次的数据目录（重装时绝对不能悄悄回到默认，否则用户会以为数据丢了）
+  data_dir="$(normalize_data_dir "${old_data_dir:-}")"
+  if [ -n "${data_dir}" ] && [ "${data_dir}" != "${link_path}" ]; then
+    say "未指定数据目录：沿用上次的位置 ${data_dir}"
+    say "（如需改回默认位置，请在应用设置页把「数据目录」选成「恢复默认位置」。）"
+  else
+    data_dir=""
+  fi
+fi
+previous_dir=""
+
+if [ -z "${data_dir}" ]; then
+  # 默认位置：必须是真实目录
+  if [ -L "${link_path}" ]; then
+    previous_dir="$(readlink -f "${link_path}" 2>/dev/null || true)"
+    rm -f "${link_path}" || fail "无法移除旧的数据目录链接：${link_path}"
+    say "数据目录已改回默认位置（原指向 ${previous_dir:-未知}，该目录与其数据均未删除）。"
+  fi
+  mkdir -p "${link_path}" || fail "创建数据目录失败：${link_path}"
+  data_dir="${link_path}"
+  say "数据目录：${data_dir}（默认位置，位于应用数据目录内）"
+else
+  if ! mkdir -p "${data_dir}" 2>/dev/null; then
+    uid_now="$(id -u 2>/dev/null || echo '')"
+    data_uid="${TRIM_UID:-${uid_now}}"
+    data_gid="${TRIM_GID:-$(id -g 2>/dev/null || echo "${uid_now}")}"
+    probe="${data_dir}"
+    while [ ! -e "${probe}" ] && [ "${probe}" != "/" ]; do probe="$(dirname "${probe}")"; done
+    fail "数据目录不可写：${data_dir}
+  成因B：这个路径建不出来——父目录 ${probe} 不允许本应用写入（属主 $(owner_desc "${probe}")，权限 $(stat -c '%a' "${probe}" 2>/dev/null || echo 未知)）。
+
+  【可以直接粘，执行后再安装一次】
+    sudo mkdir -p ${data_dir}
+    sudo chown -R ${data_uid}:${data_gid} ${data_dir}
+    sudo chmod 750 ${data_dir}
+
+  或者改用存储空间里的其它目录（例如 /vol1/rustfs-data）后重装。
+"
+  fi
+  if [ -L "${link_path}" ]; then
+    cur="$(readlink "${link_path}" 2>/dev/null || true)"
+    if [ "${cur}" != "${data_dir}" ]; then
+      previous_dir="$(readlink -f "${link_path}" 2>/dev/null || true)"
+      ln -sfn "${data_dir}" "${link_path}" || fail "无法把数据目录链接指向 ${data_dir}"
+    fi
+  elif [ -d "${link_path}" ]; then
+    if [ -z "$(ls -A "${link_path}" 2>/dev/null)" ]; then
+      rmdir "${link_path}" 2>/dev/null || true
+      ln -sfn "${data_dir}" "${link_path}" || fail "无法创建数据目录链接：${link_path}"
+    else
+      # 默认位置里已经有数据：不删、不覆盖，改名保留并告知
+      ts="$(date '+%Y%m%d%H%M%S')"
+      mv "${link_path}" "${link_path}.old-${ts}" || fail "默认数据目录已有数据且无法改名：${link_path}。请先手工处理（迁移或清空）后重试。"
+      previous_dir="${link_path}.old-${ts}"
+      ln -sfn "${data_dir}" "${link_path}" || fail "无法创建数据目录链接：${link_path}"
+    fi
+  else
+    ln -sfn "${data_dir}" "${link_path}" || fail "无法创建数据目录链接：${link_path}"
+  fi
+  say "数据目录：${data_dir}（自定义位置）"
+fi
+
+# 链接必须解析到预期目标，否则容器会挂到别处
+resolved="$(readlink -f "${link_path}" 2>/dev/null || true)"
+[ "${resolved}" = "$(readlink -f "${data_dir}" 2>/dev/null || echo "${data_dir}")" ] \
+  || fail "数据目录链接校验失败：${link_path} → ${resolved:-<无法解析>}，期望 ${data_dir}"
+
+chmod 750 "${VAR_DIR}/logs" 2>/dev/null || true
+# 只改我们自己的目录：用户共享目录（属主可能是 admin/Users）不要动它的权限位
+if [ "$(stat -c '%u' "${data_dir}" 2>/dev/null)" = "$(id -u 2>/dev/null)" ]; then
+  chmod 750 "${data_dir}" 2>/dev/null || true
+fi
+
+# 可写性：以容器运行用户身份真实写一次（不看属主 —— fnOS 的 TrimACL 会给包用户单独授权，
+# 属主是 admin 的目录照样能写；旧代码的「属主 UID 比对」把这种目录判死过，真机已复现）。
+uid_now="$(id -u 2>/dev/null || echo '')"
+data_uid="${TRIM_UID:-${uid_now}}"
+data_gid="${TRIM_GID:-$(id -g 2>/dev/null || echo "${uid_now}")}"
+owner_uid="$(stat -c '%u' "${data_dir}" 2>/dev/null || echo '')"
+owner_name="$(owner_desc "${data_dir}")"
+owner_mode="$(stat -c '%a' "${data_dir}" 2>/dev/null || echo 未知)"
+
+if ! probe_writable "${data_dir}"; then
+  if [ -d "${data_dir}" ]; then
+    fail "数据目录不可写：${data_dir}
+  成因A：目录已存在，但以本应用身份（UID ${data_uid}、组 ${data_gid}）写不进去。
+  该目录属主 ${owner_name}，权限 ${owner_mode}。
+
+  【可以直接粘，执行后再安装一次】
+    sudo chown -R ${data_uid}:${data_gid} ${data_dir}
+    sudo chmod 750 ${data_dir}
+"
+  else
+    fail "数据目录不可写：${data_dir}
+  成因B：这个路径还没建成，且父目录不允许本应用写入（当前身份 UID ${uid_now}，容器用户 UID ${data_uid}）。
+
+  【可以直接粘】
+    sudo mkdir -p ${data_dir}
+    sudo chown -R ${data_uid}:${data_gid} ${data_dir}
+    sudo chmod 750 ${data_dir}
+
+  或者改用存储空间里的其它目录（例如 /vol1/rustfs-data）后重装。
+"
+  fi
+fi
+
+# 可写但不是我们的属主 —— fnOS 上正常（TrimACL 授权），说明一句免得以后误判
+if [ -n "${owner_uid}" ] && [ "${owner_uid}" != "${data_uid}" ]; then
+  say "提示：${data_dir} 的属主是 ${owner_name}（UID ${owner_uid}），不是本应用用户（UID ${data_uid}），但实际可写（fnOS 的 TrimACL 已授权）。继续。"
+fi
+say "数据目录可写（已以 UID ${data_uid} 实际写入验证）：${data_dir}"
+
+# 用默认位置时，如果之前切走留了 data.old-*，必须告诉用户旧库在哪（否则会以为数据丢了）
+if [ "$(readlink -f "${data_dir}" 2>/dev/null || echo "${data_dir}")" = "$(readlink -f "${link_path}" 2>/dev/null || echo "${link_path}")" ] \
+   && [ ! -L "${link_path}" ]; then
+  report_stale_default_data "${VAR_DIR}" "${data_subdir}" "${link_path}"
+fi
+
+if [ -n "${previous_dir}" ]; then
+  warn "原数据目录：${previous_dir}（未删除）。"
+  warn "如需把旧数据搬过去，先停应用，再执行：cp -a ${previous_dir}/. ${data_dir}/ && sudo chown -R ${TRIM_UID}:${TRIM_GID} ${data_dir}"
+fi
+
+# ---------------------------------------------------------------------------
+# 2) 管理员凭据
+#
+# 用户要求：安装界面里直接填「管理员账号 / 密码」，不要让小白去某个路径里翻密钥。
+# 因此向导填了就用向导值；两个都留空才走「自动生成 + 在安装结果里显著打印一次」。
+# 凭据只落文件（600）并通过 RUSTFS_*_FILE 注入，绝不进容器 env（docker inspect 可见）。
+# ---------------------------------------------------------------------------
+ak_file="${CRED_DIR}/access_key"
+sk_file="${CRED_DIR}/secret_key"
+ak_in="${wizard_access_key:-}"
+sk_in="${wizard_secret_key:-}"
+cred_source=""   # 空 = 本次没有改写凭据，写 settings 时保留原值
+
+if [ -n "${ak_in}" ] || [ -n "${sk_in}" ]; then
+  if [ -z "${ak_in}" ] || [ -z "${sk_in}" ]; then
+    only="账号"
+    [ -n "${ak_in}" ] || only="密码"
+    fail "管理员账号与密码必须「两个都填」或「两个都留空」，现在只填了${only}。
+  两个都填  = 用你填的这组（推荐，装完就用它登录控制台）
+  两个都留空 = 沿用上一次安装/以前设置过的凭据；若从来没有过，则自动生成一组并在安装结果里显示
+  请返回安装向导，把另一个字段也填上（或把已填的清空）后重试。"
+  fi
+  printf '%s' "${ak_in}" | grep -Eq '^[A-Za-z0-9._-]{3,32}$' \
+    || fail "管理员账号格式不对：只允许字母、数字、点、下划线、连字符，3–32 个字符，且不能包含斜杠 /。"
+  case "${sk_in}" in
+    *[[:space:]]*) fail "管理员密码不能包含空格。" ;;
+  esac
+  [ "${#sk_in}" -ge 8 ] || fail "管理员密码至少 8 个字符（建议 12 位以上）。"
+  [ "${#sk_in}" -le 64 ] || fail "管理员密码最长 64 个字符。"
+  [ "${ak_in}" != "${sk_in}" ] || fail "管理员账号与密码不能相同。"
+  printf '%s\n' "${ak_in}" >"${ak_file}" || fail "写入 ${ak_file} 失败。"
+  printf '%s\n' "${sk_in}" >"${sk_file}" || fail "写入 ${sk_file} 失败。"
+  chmod 600 "${ak_file}" "${sk_file}" 2>/dev/null || true
+  cred_source="wizard"
+  trace "credentials from wizard ak_len=${#ak_in} sk_len=${#sk_in}"
+elif [ -s "${ak_file}" ] && [ -s "${sk_file}" ]; then
+  say "检测到你之前设置过管理员凭据（上一次安装或应用设置里保存的那组），本次沿用，未做任何改动。"
+  say "如需更换：在安装向导里把「管理员账号」和「管理员密码」两个都填上，再装一次即可。"
+else
+  gen_ak() { LC_ALL=C tr -dc 'A-Z0-9' </dev/urandom | head -c 20; }
+  gen_sk() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 40; }
+  ak="$(gen_ak)"; sk="$(gen_sk)"
+  [ ${#ak} -eq 20 ] || fail "生成访问凭据失败（长度异常）。"
+  [ ${#sk} -eq 40 ] || fail "生成密钥失败（长度异常）。"
+  # 官方约束：只读文件第一行、去空白与 CR；空文件或不可读=启动失败
+  printf '%s\n' "${ak}" >"${ak_file}" || fail "写入 ${ak_file} 失败。"
+  printf '%s\n' "${sk}" >"${sk_file}" || fail "写入 ${sk_file} 失败。"
+  chmod 600 "${ak_file}" "${sk_file}" 2>/dev/null || true
+  cred_source="generated"
+fi
+
+cat >"${SETTINGS}" <<EOF
+API_PORT=${TRIM_SERVICE_PORT:-9200}
+CONSOLE_PORT=${wizard_console_port:-9201}
+DATA_SUBDIR=${data_subdir}
+DATA_DIR=${data_dir}
+DATA_DIR_MODE=$(derive_data_mode "${data_dir}" "${link_path}")
+LOG_LEVEL=${wizard_log_level:-error}
+CONSOLE_ENABLE=${wizard_console_enable:-true}
+CRED_SOURCE=${cred_source:-${old_cred_source:-existing}}
+EOF
+chmod 600 "${SETTINGS}" 2>/dev/null || true
+
+console_url="http://<NAS-IP>:${wizard_console_port:-9201}/rustfs/console/"
+{
+  echo "=============================================================="
+  echo " RustFS 登录信息"
+  echo "--------------------------------------------------------------"
+  if [ "${cred_source}" = "wizard" ]; then
+    echo "  管理员账号 : $(cat "${ak_file}")"
+    echo "  管理员密码 : （你刚才在安装向导里填的那个，本程序不回显）"
+  else
+    echo "  管理员账号 : $(cat "${ak_file}")"
+    echo "  管理员密码 : $(cat "${sk_file}")"
+    echo "  ↑ 这组是自动生成的，只显示这一次，请立即抄到密码管理器里"
+  fi
+  echo "  控制台地址 : ${console_url}"
+  echo "  S3 端点    : http://<NAS-IP>:${TRIM_SERVICE_PORT:-9200}"
+  echo "  数据目录   : ${data_dir}"
+  echo "--------------------------------------------------------------"
+  echo "  忘记密码？去「应用中心 → RustFS → 设置」直接改新的，不用找文件。"
+  echo "=============================================================="
+} >>"${LOG_FILE}" 2>/dev/null || true
+
+case "${cred_source}" in
+  wizard)
+    say "管理员凭据已按向导设置写入（权限 600，日志中不回显密码）。" ;;
+  generated)
+    say "已自动生成一组新的管理员凭据，账号与密码见安装结果日志（只显示这一次，请立即抄下）。" ;;
+  *)
+    say "沿用之前的凭据，凭据文件未改动。" ;;
+esac
+
+# 首装镜像检查：包用户通常没有 fnOS 镜像站的签名头（只在 root 的 docker 配置里），
+# 自行 docker pull 必定回落直连 registry-1.docker.io 并超时，因此这里只在「当前身份确实
+# 具备拉取能力」时才尝试预热，否则直接说明「交给应用中心启动时以 root 拉取」，避免白等 30-60s。
+has_registry_auth() {
+  local cfg="${DOCKER_CONFIG:-${HOME:-/nonexistent}/.docker}/config.json"
+  [ -r "${cfg}" ] || return 1
+  grep -q 'X-Meta-Sign' "${cfg}" 2>/dev/null || return 1
+  return 0
+}
+
+diag_pull_failure() {
+  local ref="$1" code net_hint cfg_hint
+  if command -v curl >/dev/null 2>&1; then
+    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 https://registry-1.docker.io/v2/ 2>/dev/null)"
+  else
+    code="n/a"
+  fi
+  case "${code}" in
+    n/a) net_hint="本机没有 curl，无法探测 registry 连通性" ;;
+    000|"") net_hint="本机直连 registry-1.docker.io 不通（超时/无出口）" ;;
+    *) net_hint="本机可连 registry-1.docker.io（HTTP ${code}），网络层正常" ;;
+  esac
+  if has_registry_auth; then
+    cfg_hint="当前身份带镜像站签名头，可以直接拉取；失败多半是 tag 不存在或镜像站临时拒绝"
+  else
+    cfg_hint="当前身份没有镜像站签名头（只在 root 的 docker 配置里），包用户自行拉取必定超时——平台设计，不是网络故障"
+  fi
+  warn "拉取失败归因：${ref}"
+  warn "  · 连通性：${net_hint}"
+  warn "  · 身份能力：${cfg_hint}"
+  warn "  · tag 是否存在：脚本无法可靠区分（registry 直连不可用），请在能上网的机器上 docker manifest inspect ${ref}"
+}
+
+image_ref="$(awk -F'image:' '/^[[:space:]]*image:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "${COMPOSE_FILE}" 2>/dev/null)"
+if [ -n "${image_ref}" ]; then
+  if [ -n "$(docker image inspect "${image_ref}" --format '{{.Id}}' 2>/dev/null || true)" ]; then
+    trace "image already present: ${image_ref}"
+  elif has_registry_auth; then
+    say "本地尚无镜像 ${image_ref}，当前身份具备镜像站签名头，尝试预热……"
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 600 docker pull "${image_ref}" >>"${VAR_DIR}/pull.log" 2>&1 && pulled=1 || pulled=0
+    else
+      docker pull "${image_ref}" >>"${VAR_DIR}/pull.log" 2>&1 && pulled=1 || pulled=0
+    fi
+    if [ "${pulled}" = "1" ]; then
+      say "镜像预热完成：$(docker image inspect "${image_ref}" --format '{{.Id}}' 2>/dev/null || echo unknown)"
+    else
+      diag_pull_failure "${image_ref}"
+      warn "镜像预热失败。安装继续；应用首次启动时会由应用中心以 root 身份再拉一次。详见 ${VAR_DIR}/pull.log"
+    fi
+  else
+    say "本地尚无镜像 ${image_ref}：将由应用中心在启动阶段以 root 身份拉取（包用户无镜像站签名头，不能自行拉取，这是平台设计）。"
+  fi
+fi
+
+trace "install_callback ok data_dir=${data_dir} cred=${cred_source}"
+exit 0
