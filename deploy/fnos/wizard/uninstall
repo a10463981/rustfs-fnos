@@ -1,0 +1,25 @@
+[
+  {
+    "stepTitle": "卸载 RustFS",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "关于对象数据：如果你的数据目录是自己指定的存储空间（例如 /vol2/rustfs-data），卸载不会删除那里的任何数据，下面选「保留」或「删除」都不影响它——重新安装时把同一个路径填回去即可继续使用。只有当数据在应用默认位置（数据目录显示为应用自己的 var 目录）时，下面的选择才决定它是否被删除。"
+      },
+      {
+        "type": "tips",
+        "helpText": "注意：卸载会一并清除访问凭据（Access Key / Secret Key）。之后重新安装会生成一组全新的密钥，所有已接入本服务的 S3 客户端、备份任务与其他应用都需要改成新密钥，否则会收到 403 InvalidAccessKeyId。若这些客户端不在你手边，建议先记录当前配置再卸载。"
+      },
+      {
+        "type": "radio",
+        "field": "wizard_data_action",
+        "label": "对象数据处理",
+        "initValue": "keep",
+        "options": [
+          { "label": "保留数据（推荐）", "value": "keep" },
+          { "label": "删除全部数据（不可恢复）", "value": "delete" }
+        ]
+      }
+    ]
+  }
+]

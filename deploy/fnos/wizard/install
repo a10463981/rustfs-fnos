@@ -1,0 +1,105 @@
+[
+  {
+    "stepTitle": "管理员账号密码",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "下面两个就是你以后登录 RustFS 用的账号与密码（Access Key / Secret Key）：网页控制台用它登录，S3 客户端（备份软件、媒体库等）也用它连接。请现在就填一个自己记得住的，并抄到密码管理器里。忘记密码不要紧——以后可以在「应用中心 → RustFS → 设置」里直接改。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_access_key",
+        "label": "管理员账号（Access Key）",
+        "initValue": "admin",
+        "rules": [
+          { "pattern": "^$|^[A-Za-z0-9._-]{3,32}$", "message": "只能包含字母、数字、点、下划线、连字符；3–32 个字符；不能包含斜杠 /。例如 admin 或 backup-admin" }
+        ]
+      },
+      {
+        "type": "password",
+        "field": "wizard_secret_key",
+        "label": "管理员密码（Secret Key）",
+        "initValue": "",
+        "rules": [
+          { "pattern": "^$|^[A-Za-z0-9._~!@#$%^&*()+=-]{8,64}$", "message": "至少 8 个字符（建议 12 位以上），可使用字母、数字与常见符号，不能有空格与斜杠。请不要用你的飞牛登录密码。" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "提示：账号和密码都要填或都留空。留空时安装程序会自动生成一组随机凭据，并把「账号 + 密码」显示在安装结果的日志里（只显示这一次）。为免找起来麻烦，建议直接在这里填好。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "数据存放位置（重要）",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "⚠️ 请务必看完这一条再往下点。对象数据（你存的备份、照片、文件）会放在下面这个目录里。默认位置是「应用数据目录」（/vol<N>/@appdata/rustfs-fnos/data），它通常位于安装应用的那个存储空间——很多人的这个空间只有几十 GB，而对象存储会一直增长。更麻烦的是：默认位置属于应用自己的目录，卸载应用或安装失败回滚时，它有被一并清理的风险。"
+      },
+      {
+        "type": "tips",
+        "helpText": "✅ 建议做法：先到「存储空间管理」确认哪块盘空间最大，然后在「文件管理」里建一个专用目录（例如 大容量空间下的 rustfs-data），再把它的完整路径填到下面。这样数据在你的存储空间里，卸载/重装应用不会动它。留空则使用默认位置。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_data_dir",
+        "label": "数据存放目录（留空 = 默认位置）",
+        "initValue": "",
+        "rules": [
+          { "pattern": "^$|^(/[A-Za-z0-9._-]+)+$", "message": "请填完整绝对路径，例如 /vol2/rustfs-data（以 / 开头，只用字母、数字、点、下划线、连字符）。不能填 /、/etc、/var 或其它应用的目录。" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "数据目录大小提醒：RustFS 单机单盘部署，不支持原地扩容。请一次选够——以后想换大盘只能新建一个实例再把数据搬过去。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "端口与运行参数",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "S3 API 端口由应用清单固定为 9200（manifest.service_port），这里只调整控制台端口与日志级别。"
+      },
+      {
+        "type": "text",
+        "field": "wizard_console_port",
+        "label": "Web 控制台端口（宿主侧）",
+        "initValue": "9201",
+        "rules": [
+          { "required": true, "message": "请填写控制台端口" },
+          { "pattern": "^(1[0-9]{3}|[2-9][0-9]{3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$", "message": "端口需为 1000–65535 之间的整数" }
+        ]
+      },
+      {
+        "type": "select",
+        "field": "wizard_log_level",
+        "label": "日志级别",
+        "initValue": "error",
+        "options": [
+          { "label": "error（推荐，最省空间）", "value": "error" },
+          { "label": "warn", "value": "warn" },
+          { "label": "info", "value": "info" },
+          { "label": "debug", "value": "debug" }
+        ]
+      },
+      {
+        "type": "switch",
+        "field": "wizard_console_enable",
+        "label": "启用 Web 控制台",
+        "initValue": "true"
+      },
+      {
+        "type": "text",
+        "field": "wizard_data_subdir",
+        "label": "数据子目录名（高级，通常不用改）",
+        "initValue": "data",
+        "rules": [
+          { "pattern": "^$|^[a-z0-9][a-z0-9_-]{0,31}$", "message": "只允许小写字母、数字、下划线与连字符，长度 1–32，且以字母或数字开头" }
+        ]
+      }
+    ]
+  }
+]

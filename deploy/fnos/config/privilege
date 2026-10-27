@@ -1,0 +1,9 @@
+{
+    "defaults":
+    {
+        "run-as": "package"
+    },
+    "username": "rustfs-fnos",
+    "groupname": "rustfs-fnos",
+    "join-groups": ["docker", "Users"]
+}

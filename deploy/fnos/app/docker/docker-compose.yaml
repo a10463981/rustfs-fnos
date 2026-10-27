@@ -1,0 +1,47 @@
+# RustFS fpk —— 由应用中心按 config/resource 的 docker-project 托管
+# 重要：所有宿主路径必须走 ${TRIM_*}，不得写死宿主绝对路径（换卷/迁移后会失效）
+services:
+  rustfs:
+    image: docker.io/rustfs/rustfs:1.0.4
+    container_name: rustfs-fnos
+    # 容器默认以 10001:10001 运行，而 fpk 的目录属主是包用户；
+    # 官方文档允许用 user: <host-uid>:<host-gid> 覆盖，这里对齐到包用户，避免 chown + root。
+    user: "${TRIM_UID:?TRIM_UID missing}:${TRIM_GID:?TRIM_GID missing}"
+    command: ["/data"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "${TRIM_SERVICE_PORT:-9200}:9000"
+      - "${wizard_console_port:-9201}:9001"
+    volumes:
+      # 注意：这一行永远指向 ${TRIM_PKGVAR}/<subdir>，不要改成用户填的路径。
+      # compose 拿不到我们 settings.env 里的变量（它只认应用中心注入的 env），
+      # 变量为空会让挂载变成 ":/data" 直接起不来。
+      # 用户自定义的数据位置由 cmd/install_callback 用一个符号链接实现：
+      #   ${TRIM_PKGVAR}/<subdir>  →  /vol2/rustfs-data（举例）
+      # 换目录 = 换链接，不搬数据，compose 无需知情。
+      - "${TRIM_PKGVAR}/${wizard_data_subdir:-data}:/data"
+      - "${TRIM_PKGVAR}/logs:/var/log/rustfs"
+      - "${TRIM_PKGETC}/credentials:/etc/rustfs:ro"
+    environment:
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "${wizard_console_enable:-true}"
+      RUSTFS_OBS_LOGGER_LEVEL: "${wizard_log_level:-error}"
+      RUSTFS_OBS_LOG_DIRECTORY: "/var/log/rustfs/"
+      # 凭据只走文件，不走 env（env 在 docker inspect 里明文可见）
+      RUSTFS_ACCESS_KEY_FILE: "/etc/rustfs/access_key"
+      RUSTFS_SECRET_KEY_FILE: "/etc/rustfs/secret_key"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      # 镜像内若既无 curl 也无 wget，本项会一直 unhealthy —— 届时删掉 healthcheck 即可，
+      # cmd/main 的 status 是在宿主侧探针判断的，不依赖它。
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/health/ready || wget -qO- http://127.0.0.1:9000/health/ready || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s

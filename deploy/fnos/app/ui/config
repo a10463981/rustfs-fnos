@@ -1,0 +1,16 @@
+{
+    ".url": {
+        "rustfs-fnos.console": {
+            "title": "RustFS 控制台",
+            "icon": "images/icon_{0}.png",
+            "type": "url",
+            "protocol": "http",
+            "port": "${wizard_console_port}",
+            "url": "/rustfs/console/",
+            "allUsers": false,
+            "control": {
+                "accessPerm": "readonly"
+            }
+        }
+    }
+}

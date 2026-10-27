@@ -1,0 +1,23 @@
+appname                    = rustfs-fnos
+version                    = 0.0.0
+display_name               = RustFS
+desc                       = <p>RustFS 是 S3 兼容的高性能对象存储。安装时可自定义管理员账号密码，以及对象数据的存放目录。</p><p>S3 API：宿主 9200 → 容器 9000；Web 控制台：宿主 9201 → 容器 9001。</p><p>数据目录安装时可选：默认放在应用数据目录（空间可能较小），也可以指定你自己的大容量存储空间下的目录——后者在卸载应用时不会被一并清理。</p>
+source                     = thirdparty
+platform                   = x86
+maintainer                 = TODO-maintainer
+maintainer_url             = https://github.com/TODO-owner/rustfs-fnos
+distributor                = TODO-maintainer
+distributor_url            = https://github.com/TODO-owner/rustfs-fnos
+ctl_stop                   = true
+desktop_uidir              = ui
+desktop_applaunchname      = rustfs-fnos.console
+service_port               = 9200
+checkport                  = true
+changelog                  = 首发 1.0.4：安装时直接设定管理员账号密码；数据目录可指向自定义存储空间；S3 API 9200 / 控制台 9201
+# 待测试机回填：在 .64 上跑通后，把实测的 fnOS 版本号填进下面两行并取消注释；
+# 当前不声明这两项 = 不做兼容性承诺（README 必须写明"仅在 <实测版本> 验证"）
+# os_min_version           =
+# os_max_version           =
+# install_type / install_dep_apps 均不声明：
+#   install_type 不写 = 安装时由用户选择存储位置（写 root 会落到系统分区）
+#   install_dep_apps 不写 = 无法确认 docker 是可声明的依赖名，由 cmd/install_init 运行期检测
