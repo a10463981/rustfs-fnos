@@ -50,6 +50,19 @@ wait_ready() {
   return 1
 }
 
+# API 端口的唯一真源是 settings.env 的 API_PORT（用户可能在向导里改过）：
+#   优先级 API_PORT → TRIM_SERVICE_PORT → 9200。
+# 不能只用 TRIM_SERVICE_PORT —— 那是 manifest.service_port 的静态值，用户改成 9300 后它就过时了。
+api_port_resolved() {
+  local p=""
+  if [ -r "${SETTINGS}" ]; then
+    p="$(awk -F= '/^[[:space:]]*API_PORT[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "${SETTINGS}" 2>/dev/null)"
+  fi
+  [ -n "${p}" ] || p="${TRIM_SERVICE_PORT:-9200}"
+  case "${p}" in ''|*[!0-9]*) p=9200 ;; esac
+  printf '%s' "${p}"
+}
+
 image_id() { docker image inspect "$1" --format '{{.Id}}' 2>/dev/null || true; }
 container_image_id() { docker inspect -f '{{.Image}}' "${CONTAINER}" 2>/dev/null || true; }
 
@@ -95,7 +108,7 @@ trace "upgrade_init ref=${prev_ref} compose_ref=${compose_ref} ref_id=${ref_id:-
 
 # 升级前必须健康
 if [ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null)" = "true" ]; then
-  probe_ready "${API_PORT:-9200}" || fail "当前实例未就绪（/health/ready 非 200），请先排查（docker logs ${CONTAINER}）再升级。"
+  probe_ready "$(api_port_resolved)" || fail "当前实例未就绪（/health/ready 非 200），请先排查（docker logs ${CONTAINER}）再升级。"
 fi
 
 mkdir -p "${TRIM_PKGTMP}" 2>/dev/null || true

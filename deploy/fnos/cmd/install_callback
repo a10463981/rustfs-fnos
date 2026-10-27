@@ -157,6 +157,77 @@ report_stale_default_data() { # $1=VAR_DIR $2=subdir 名 $3=当前默认目录
   return 0
 }
 
+# ---- 端口解析与 compose 渲染（四个 *_init / *_callback 共用）----
+# 为什么需要：manifest.service_port 是静态字段（写 9200），向导改不了它；用户要能自定义 API 端口，
+# 就只能让「真值」落在 settings.env，并把这真值渲染进 compose 的 ports 行。
+# （compose 读不到 settings.env，也不保证拿得到 wizard_* —— 所以不赌插值，直接渲染文件。）
+#
+# 优先级（wizard 只代表「本次操作」，所以它在最前）：
+#   ① wizard_api_port（本次向导填的）
+#   ② settings.env 的 API_PORT（上次已生效的）
+#   ③ TRIM_SERVICE_PORT（平台按 manifest 注入，通常 9200）
+#   ④ 9200
+resolve_api_port() {
+  local p=""
+  if [ -n "${wizard_api_port:-}" ]; then
+    p="${wizard_api_port}"
+  elif [ -r "${SETTINGS}" ]; then
+    p="$(awk -F= '/^[[:space:]]*API_PORT[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "${SETTINGS}" 2>/dev/null)"
+  fi
+  [ -n "${p}" ] || p="${TRIM_SERVICE_PORT:-9200}"
+  case "${p}" in ''|*[!0-9]*) p="${TRIM_SERVICE_PORT:-9200}" ;; esac
+  printf '%s' "${p}"
+}
+
+# 把 API / 控制台端口渲染进 compose 的 ports 两行（幂等；只认以 :9000 / :9001 结尾的映射行）
+# 为什么改文件而不是用 ${VAR} 插值：平台创建容器时用的是它自己的 compose 调用，
+# 我们无法保证它带上我们的环境变量；而 base compose 文件在 TRIM_APPDEST 下、包用户可写（真机已验证）。
+render_compose_ports() { # $1=compose 文件 $2=API 端口 $3=控制台端口
+  local f="$1" api="$2" con="$3"
+  [ -f "${f}" ] || return 1
+  case "${api}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${con}" in ''|*[!0-9]*) return 1 ;; esac
+  sed -i "s|^\([[:space:]]*-[[:space:]]*\)\"[^\"]*:9000\"|\1\"${api}:9000\"|" "${f}" 2>/dev/null || return 1
+  sed -i "s|^\([[:space:]]*-[[:space:]]*\)\"[^\"]*:9001\"|\1\"${con}:9001\"|" "${f}" 2>/dev/null || return 1
+  return 0
+}
+
+
+# 把真实 API 端口渲染进 gateway.conf 的注入脚本（幂等：按 `var p = <数字>;` 重写）。
+# 为什么需要：窗口内打开时，页面要替用户把「服务器地址」写进 localStorage，端口必须是对的
+# （真源是 settings.env 的 API_PORT；渲染后 gateway 容器挂载的这份配置即生效于新请求）。
+render_gateway_conf() { # $1=gateway.conf 路径  $2=API 端口
+  local f="$1" api="$2" n_before n_after
+  [ -f "${f}" ] || return 1
+  case "${api}" in ''|*[!0-9]*) return 1 ;; esac
+
+  # 形态契约（真机踩过，别改）：端口必须写成「单独一条语句、分号结尾」的 `var p = <数字>;`。
+  # 逗号连写（`var k=...,p = 9200,...`）JS 语义等价，但本函数的正则匹配不到 →
+  # 渲染静默不做 → **装出来的端口会停在模板值**（这类“看起来只是排版”的差异最难查）。
+  # 所以这里先探一次：数量为 0 时区分「文件不对」和「写法不对」，后者给出可操作提示。
+  n_before="$(grep -o 'var p = [0-9]*;' "${f}" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n_before:-0}" -eq 0 ]; then
+    if grep -v '^[[:space:]]*#' "${f}" 2>/dev/null | grep -Eq 'p = [0-9]+[,)]'; then
+      warn "gateway.conf 的端口写成了逗号形态（p = <数字>,）—— 渲染只认「单独一条语句、分号结尾」的 var p = <数字>;，
+  当前写法不会被替换，端口会停在模板值（不是 ${api}）。请把注入脚本改回：
+    var p = <数字>;var k=\"rustfs-server-host\",s=window.localStorage,h=location.hostname;…
+  （逗号连写只是排版差异，但会让本函数完全失效。）"
+    fi
+    return 1                                        # 一个都没有 → 文件形态不对
+  fi
+
+  # 全量替换：注入脚本在多个精确 location 里各有一份，统计出现次数（不是行数）并全部替换。
+  sed -i -E "s/(var p = )[0-9]+;/\1${api};/g" "${f}" 2>/dev/null || return 1
+  n_after="$(grep -o "var p = ${api};" "${f}" 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${n_after}" = "${n_before}" ] || return 1      # 有漏替换 → 报错，别静默
+
+  # 零残留：目标端口不是模板值 9200 时，渲染后不该再出现模板值（防止“部分替换”）
+  if [ "${api}" != "9200" ] && grep -q 'var p = 9200;' "${f}" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
 probe_writable() { # $1=已存在的目录；0=可写 1=不可写
   local dir="$1" p cur_uid target_uid target_gid
   [ -d "${dir}" ] || return 1
@@ -220,6 +291,20 @@ data_subdir="${wizard_data_subdir:-data}"
 case "${data_subdir}" in
   ''|*[!a-z0-9_-]*) fail "数据子目录名非法：${data_subdir}（只允许小写字母、数字、下划线、连字符）" ;;
 esac
+
+# 端口：API 可由向导自定义；控制台同理。真值写进 settings.env，并渲染进 compose 的 ports 行。
+api_port="$(resolve_api_port)"
+console_port="${wizard_console_port:-9201}"
+case "${api_port}" in ''|*[!0-9]*) fail "S3 API 端口非法：${api_port}" ;; esac
+case "${console_port}" in ''|*[!0-9]*) fail "控制台端口非法：${console_port}" ;; esac
+[ "${api_port}" != "${console_port}" ] || fail "S3 API 端口与控制台端口不能相同（都是 ${api_port}）。"
+render_compose_ports "${COMPOSE_FILE}" "${api_port}" "${console_port}" \
+  || fail "无法把端口写入 compose（${COMPOSE_FILE}）。请检查文件权限。"
+# 同一次渲染：把 API 端口写进 gateway.conf 的 HTML 注入脚本，
+# 这样「窗口内打开」时页面能自己带上正确的服务器地址，用户不用手填。
+render_gateway_conf "${TRIM_APPDEST}/docker/gateway.conf" "${api_port}" \
+  || warn "无法把 API 端口写进 gateway.conf 的注入脚本（窗口内打开时可能需要手填一次服务器地址）。"
+say "端口：S3 API ${api_port} → 容器 9000；控制台 ${console_port} → 容器 9001"
 
 mkdir -p "${VAR_DIR}/logs" "${CRED_DIR}" || fail "创建目录失败：${VAR_DIR}。请检查存储空间是否可写。"
 chmod 700 "${CRED_DIR}" 2>/dev/null || true
@@ -346,7 +431,7 @@ fi
 
 # 可写但不是我们的属主 —— fnOS 上正常（TrimACL 授权），说明一句免得以后误判
 if [ -n "${owner_uid}" ] && [ "${owner_uid}" != "${data_uid}" ]; then
-  say "提示：${data_dir} 的属主是 ${owner_name}（UID ${owner_uid}），不是本应用用户（UID ${data_uid}），但实际可写（fnOS 的 TrimACL 已授权）。继续。"
+  say "提示：${data_dir} 的属主是 ${owner_name}，不是本应用用户（UID ${data_uid}），但实际可写（fnOS 的 TrimACL 已授权）。继续。"
 fi
 say "数据目录可写（已以 UID ${data_uid} 实际写入验证）：${data_dir}"
 
@@ -413,18 +498,19 @@ else
 fi
 
 cat >"${SETTINGS}" <<EOF
-API_PORT=${TRIM_SERVICE_PORT:-9200}
-CONSOLE_PORT=${wizard_console_port:-9201}
+API_PORT=${api_port}
+CONSOLE_PORT=${console_port}
 DATA_SUBDIR=${data_subdir}
 DATA_DIR=${data_dir}
 DATA_DIR_MODE=$(derive_data_mode "${data_dir}" "${link_path}")
 LOG_LEVEL=${wizard_log_level:-error}
 CONSOLE_ENABLE=${wizard_console_enable:-true}
+CORS_ORIGINS=${wizard_cors_origins:-*}
 CRED_SOURCE=${cred_source:-${old_cred_source:-existing}}
 EOF
 chmod 600 "${SETTINGS}" 2>/dev/null || true
 
-console_url="http://<NAS-IP>:${wizard_console_port:-9201}/rustfs/console/"
+console_url="http://<NAS-IP>:${console_port}/rustfs/console/"
 {
   echo "=============================================================="
   echo " RustFS 登录信息"
@@ -438,7 +524,7 @@ console_url="http://<NAS-IP>:${wizard_console_port:-9201}/rustfs/console/"
     echo "  ↑ 这组是自动生成的，只显示这一次，请立即抄到密码管理器里"
   fi
   echo "  控制台地址 : ${console_url}"
-  echo "  S3 端点    : http://<NAS-IP>:${TRIM_SERVICE_PORT:-9200}"
+  echo "  S3 端点    : http://<NAS-IP>:${api_port}"
   echo "  数据目录   : ${data_dir}"
   echo "--------------------------------------------------------------"
   echo "  忘记密码？去「应用中心 → RustFS → 设置」直接改新的，不用找文件。"
@@ -453,6 +539,40 @@ case "${cred_source}" in
   *)
     say "沿用之前的凭据，凭据文件未改动。" ;;
 esac
+
+# ---------------------------------------------------------------------------
+# 3) 端口落地：渲染完 compose 之后，必须把已存在的容器**重建**一次
+#
+# 真机事实（v13，复现两次）：平台会在 install_callback 之前，先按**包里模板 compose**
+# 把容器拉起来（容器 Created 比 compose mtime 早 100ms）。那一次插值里
+#   · 控制台行 ${wizard_console_port:-9201} → 9301（对，说明平台会把 wizard_* 传进 compose）
+#   · API 行 ${TRIM_SERVICE_PORT:-9200} → 9200（错，因为它是 manifest.service_port 的静态值）
+# 于是「容器实际发布 9200」而「compose 声明 9300」；平台按 compose 声明探活 → 探 9300 失败
+#   → APP_STARTED 之后约 7 秒判 APP_CRASH → 用户看到「打开不久就闪退」。
+# 所以：渲染完必须重建，让「容器实际发布端口」=「compose 声明」=「settings.env」。
+# 幂等（只在容器已存在时重建）、失败只 warn（能手动救的不要变成装不上）。
+# REBUILD-AFTER-RENDER
+if docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+  pending_image="$(awk -F'image:' '/^[[:space:]]*image:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "${COMPOSE_FILE}" 2>/dev/null)"
+  if [ -n "${pending_image}" ] && [ -z "$(docker image inspect "${pending_image}" --format '{{.Id}}' 2>/dev/null || true)" ]; then
+    say "容器已存在，但镜像 ${pending_image} 不在本地：跳过重建（端口已写入 compose，容器会在镜像就绪后的首次启动生效）。"
+    warn "若应用中心把状态判为异常，请先 sudo docker pull ${pending_image}，再点「停止 → 启动」。"
+  # 不带服务名 → compose 会把**所有**服务一起拉起/重建，包括 gateway（窗口内打开用的 sidecar）；
+  # 下面的 wait_ready 只探 RustFS 的 /health/ready，所以 gateway 起得慢不会让安装判失败。
+  elif compose up -d --no-deps --force-recreate >>"${VAR_DIR}/lifecycle.log" 2>&1; then
+    if wait_ready "${api_port}" 120; then
+      say "容器已按新端口重建并就绪：S3 API ${api_port}、控制台 ${console_port}"
+      trace "install_callback recreated container ports=${api_port}/${console_port}"
+    else
+      warn "容器已重建，但 ${api_port} 在 120s 内未就绪。请在应用中心点一次「停止 → 启动」；仍失败请看 docker logs ${CONTAINER}"
+    fi
+  else
+    warn "渲染端口后重建容器失败；若端口被改过，首次启动可能被判异常，请在应用中心点一次「停止 → 启动」。"
+    warn "详情见 ${VAR_DIR}/lifecycle.log 与 docker logs ${CONTAINER}"
+  fi
+else
+  say "容器尚未创建（由应用中心在启动阶段创建）：端口已写入 compose（S3 API ${api_port}、控制台 ${console_port}），创建时即生效。"
+fi
 
 # 首装镜像检查：包用户通常没有 fnOS 镜像站的签名头（只在 root 的 docker 配置里），
 # 自行 docker pull 必定回落直连 registry-1.docker.io 并超时，因此这里只在「当前身份确实

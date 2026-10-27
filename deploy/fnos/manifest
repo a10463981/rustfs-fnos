@@ -1,21 +1,31 @@
 appname                    = rustfs-fnos
 version                    = 0.0.0
 display_name               = RustFS
-desc                       = <p>RustFS 是 S3 兼容的高性能对象存储。安装时可自定义管理员账号密码，以及对象数据的存放目录。</p><p>S3 API：宿主 9200 → 容器 9000；Web 控制台：宿主 9201 → 容器 9001。</p><p>数据目录安装时可选：默认放在应用数据目录（空间可能较小），也可以指定你自己的大容量存储空间下的目录——后者在卸载应用时不会被一并清理。</p>
+desc                       = <p>RustFS 是 S3 兼容的高性能对象存储。安装时可自定义管理员账号密码、S3 API 端口、控制台端口，以及对象数据的存放目录。</p><p>S3 API：宿主默认 9200 → 容器 9000；Web 控制台：宿主默认 9201 → 容器 9001。两个端口都可以在安装向导里改。</p><p>数据目录安装时可选：默认放在应用数据目录（空间可能较小），也可以指定你自己的大容量存储空间下的目录——后者在卸载应用时不会被一并清理。</p>
 source                     = thirdparty
 platform                   = x86
-maintainer                 = TODO-maintainer
-maintainer_url             = https://github.com/TODO-owner/rustfs-fnos
-distributor                = TODO-maintainer
-distributor_url            = https://github.com/TODO-owner/rustfs-fnos
+maintainer                 = rustfs
+maintainer_url             = https://github.com/rustfs/rustfs
+distributor                = a10463981
+distributor_url            = https://github.com/a10463981/rustfs-fnos
 ctl_stop                   = true
 desktop_uidir              = ui
 desktop_applaunchname      = rustfs-fnos.console
 service_port               = 9200
-checkport                  = true
-changelog                  = 首发 1.0.4：安装时直接设定管理员账号密码；数据目录可指向自定义存储空间；S3 API 9200 / 控制台 9201
-# 待测试机回填：在 .64 上跑通后，把实测的 fnOS 版本号填进下面两行并取消注释；
-# 当前不声明这两项 = 不做兼容性承诺（README 必须写明"仅在 <实测版本> 验证"）
+checkport                  = false
+changelog                  = 1.0.4：点桌面图标可在飞牛 fnOS 窗口内打开并登录控制台；安装时可自定义管理员账号密码、S3 API 端口、控制台端口、访问来源与数据目录
+# ---- 关于 service_port / checkport 的说明（改前必读）----
+# service_port 是静态字段，向导改不了它；它只用于「默认值展示」。
+# 真正的 API 端口真源是 settings.env 的 API_PORT（用户在向导里填），优先级：
+#   wizard_api_port → settings.env API_PORT → TRIM_SERVICE_PORT → 9200
+# checkport=false 的原因：平台按 service_port(=9200) 做占用检查，用户若把 API 端口改成 9300，
+#   平台检查的目标就错了（可能因 9200 被占而误拒，或放行一个 9300 已被占的安装）。
+#   所以端口检查完全交给 cmd/install_init（ss 探测，两个端口都查，错误文案给占用进程与改法）。
+# 端口实际生效方式：cmd/install_callback 与 config_callback 把端口「渲染」进
+#   app/docker/docker-compose.yaml 的 ports 两行，再重建容器（compose 读不到 settings.env，不能赌插值）。
+#
+# 待测试机回填：os_min_version / os_max_version 当前不声明 = 不做兼容性承诺。
+# 发布时必须确保 README 写明「仅在实测过的 fnOS 版本上验证」，否则相当于对全版本做隐含承诺。
 # os_min_version           =
 # os_max_version           =
 # install_type / install_dep_apps 均不声明：

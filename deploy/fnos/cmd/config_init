@@ -150,6 +150,77 @@ report_stale_default_data() { # $1=VAR_DIR $2=subdir 名 $3=当前默认目录
   return 0
 }
 
+# ---- 端口解析与 compose 渲染（四个 *_init / *_callback 共用）----
+# 为什么需要：manifest.service_port 是静态字段（写 9200），向导改不了它；用户要能自定义 API 端口，
+# 就只能让「真值」落在 settings.env，并把这真值渲染进 compose 的 ports 行。
+# （compose 读不到 settings.env，也不保证拿得到 wizard_* —— 所以不赌插值，直接渲染文件。）
+#
+# 优先级（wizard 只代表「本次操作」，所以它在最前）：
+#   ① wizard_api_port（本次向导填的）
+#   ② settings.env 的 API_PORT（上次已生效的）
+#   ③ TRIM_SERVICE_PORT（平台按 manifest 注入，通常 9200）
+#   ④ 9200
+resolve_api_port() {
+  local p=""
+  if [ -n "${wizard_api_port:-}" ]; then
+    p="${wizard_api_port}"
+  elif [ -r "${SETTINGS}" ]; then
+    p="$(awk -F= '/^[[:space:]]*API_PORT[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "${SETTINGS}" 2>/dev/null)"
+  fi
+  [ -n "${p}" ] || p="${TRIM_SERVICE_PORT:-9200}"
+  case "${p}" in ''|*[!0-9]*) p="${TRIM_SERVICE_PORT:-9200}" ;; esac
+  printf '%s' "${p}"
+}
+
+# 把 API / 控制台端口渲染进 compose 的 ports 两行（幂等；只认以 :9000 / :9001 结尾的映射行）
+# 为什么改文件而不是用 ${VAR} 插值：平台创建容器时用的是它自己的 compose 调用，
+# 我们无法保证它带上我们的环境变量；而 base compose 文件在 TRIM_APPDEST 下、包用户可写（真机已验证）。
+render_compose_ports() { # $1=compose 文件 $2=API 端口 $3=控制台端口
+  local f="$1" api="$2" con="$3"
+  [ -f "${f}" ] || return 1
+  case "${api}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${con}" in ''|*[!0-9]*) return 1 ;; esac
+  sed -i "s|^\([[:space:]]*-[[:space:]]*\)\"[^\"]*:9000\"|\1\"${api}:9000\"|" "${f}" 2>/dev/null || return 1
+  sed -i "s|^\([[:space:]]*-[[:space:]]*\)\"[^\"]*:9001\"|\1\"${con}:9001\"|" "${f}" 2>/dev/null || return 1
+  return 0
+}
+
+
+# 把真实 API 端口渲染进 gateway.conf 的注入脚本（幂等：按 `var p = <数字>;` 重写）。
+# 为什么需要：窗口内打开时，页面要替用户把「服务器地址」写进 localStorage，端口必须是对的
+# （真源是 settings.env 的 API_PORT；渲染后 gateway 容器挂载的这份配置即生效于新请求）。
+render_gateway_conf() { # $1=gateway.conf 路径  $2=API 端口
+  local f="$1" api="$2" n_before n_after
+  [ -f "${f}" ] || return 1
+  case "${api}" in ''|*[!0-9]*) return 1 ;; esac
+
+  # 形态契约（真机踩过，别改）：端口必须写成「单独一条语句、分号结尾」的 `var p = <数字>;`。
+  # 逗号连写（`var k=...,p = 9200,...`）JS 语义等价，但本函数的正则匹配不到 →
+  # 渲染静默不做 → **装出来的端口会停在模板值**（这类“看起来只是排版”的差异最难查）。
+  # 所以这里先探一次：数量为 0 时区分「文件不对」和「写法不对」，后者给出可操作提示。
+  n_before="$(grep -o 'var p = [0-9]*;' "${f}" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n_before:-0}" -eq 0 ]; then
+    if grep -v '^[[:space:]]*#' "${f}" 2>/dev/null | grep -Eq 'p = [0-9]+[,)]'; then
+      warn "gateway.conf 的端口写成了逗号形态（p = <数字>,）—— 渲染只认「单独一条语句、分号结尾」的 var p = <数字>;，
+  当前写法不会被替换，端口会停在模板值（不是 ${api}）。请把注入脚本改回：
+    var p = <数字>;var k=\"rustfs-server-host\",s=window.localStorage,h=location.hostname;…
+  （逗号连写只是排版差异，但会让本函数完全失效。）"
+    fi
+    return 1                                        # 一个都没有 → 文件形态不对
+  fi
+
+  # 全量替换：注入脚本在多个精确 location 里各有一份，统计出现次数（不是行数）并全部替换。
+  sed -i -E "s/(var p = )[0-9]+;/\1${api};/g" "${f}" 2>/dev/null || return 1
+  n_after="$(grep -o "var p = ${api};" "${f}" 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${n_after}" = "${n_before}" ] || return 1      # 有漏替换 → 报错，别静默
+
+  # 零残留：目标端口不是模板值 9200 时，渲染后不该再出现模板值（防止“部分替换”）
+  if [ "${api}" != "9200" ] && grep -q 'var p = 9200;' "${f}" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
 probe_writable() { # $1=已存在的目录；0=可写 1=不可写
   local dir="$1" p cur_uid target_uid target_gid
   [ -d "${dir}" ] || return 1
@@ -340,7 +411,21 @@ port_busy() {
   (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && { exec 3<&- 2>/dev/null; return 0; } || return 1
 }
 
-# 1) 控制台端口
+# 1) 端口：API 与控制台都可以在设置页改
+if [ -n "${wizard_api_port:-}" ]; then
+  case "${wizard_api_port}" in
+    ''|*[!0-9]*) fail "S3 API 端口非法：${wizard_api_port}" ;;
+  esac
+  if [ "${wizard_api_port}" != "${API_PORT:-9200}" ] && port_busy "${wizard_api_port}"; then
+    fail "S3 API 端口 ${wizard_api_port} 已被占用。
+  处理：换一个空闲端口（例如 9300），或停掉占用程序
+  （sudo ss -lntp | grep -E ':${wizard_api_port}\\b'）。"
+  fi
+  [ "${wizard_api_port}" != "${wizard_console_port:-${CONSOLE_PORT:-9201}}" ] \
+    || fail "S3 API 端口与控制台端口不能相同（都是 ${wizard_api_port}）。"
+fi
+
+# 1b) 控制台端口
 if [ -n "${wizard_console_port:-}" ]; then
   case "${wizard_console_port}" in
     ''|*[!0-9]*) fail "控制台端口非法：${wizard_console_port}" ;;
@@ -348,7 +433,7 @@ if [ -n "${wizard_console_port:-}" ]; then
   if [ "${wizard_console_port}" != "${CONSOLE_PORT:-9201}" ] && port_busy "${wizard_console_port}"; then
     fail "端口 ${wizard_console_port} 已被占用，请换一个端口。"
   fi
-  [ "${wizard_console_port}" != "${TRIM_SERVICE_PORT:-9200}" ] \
+  [ "${wizard_console_port}" != "${wizard_api_port:-${API_PORT:-9200}}" ] \
     || fail "控制台端口不能与 S3 API 端口相同（${wizard_console_port}）。"
 fi
 

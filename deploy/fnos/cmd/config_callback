@@ -157,6 +157,77 @@ report_stale_default_data() { # $1=VAR_DIR $2=subdir 名 $3=当前默认目录
   return 0
 }
 
+# ---- 端口解析与 compose 渲染（四个 *_init / *_callback 共用）----
+# 为什么需要：manifest.service_port 是静态字段（写 9200），向导改不了它；用户要能自定义 API 端口，
+# 就只能让「真值」落在 settings.env，并把这真值渲染进 compose 的 ports 行。
+# （compose 读不到 settings.env，也不保证拿得到 wizard_* —— 所以不赌插值，直接渲染文件。）
+#
+# 优先级（wizard 只代表「本次操作」，所以它在最前）：
+#   ① wizard_api_port（本次向导填的）
+#   ② settings.env 的 API_PORT（上次已生效的）
+#   ③ TRIM_SERVICE_PORT（平台按 manifest 注入，通常 9200）
+#   ④ 9200
+resolve_api_port() {
+  local p=""
+  if [ -n "${wizard_api_port:-}" ]; then
+    p="${wizard_api_port}"
+  elif [ -r "${SETTINGS}" ]; then
+    p="$(awk -F= '/^[[:space:]]*API_PORT[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "${SETTINGS}" 2>/dev/null)"
+  fi
+  [ -n "${p}" ] || p="${TRIM_SERVICE_PORT:-9200}"
+  case "${p}" in ''|*[!0-9]*) p="${TRIM_SERVICE_PORT:-9200}" ;; esac
+  printf '%s' "${p}"
+}
+
+# 把 API / 控制台端口渲染进 compose 的 ports 两行（幂等；只认以 :9000 / :9001 结尾的映射行）
+# 为什么改文件而不是用 ${VAR} 插值：平台创建容器时用的是它自己的 compose 调用，
+# 我们无法保证它带上我们的环境变量；而 base compose 文件在 TRIM_APPDEST 下、包用户可写（真机已验证）。
+render_compose_ports() { # $1=compose 文件 $2=API 端口 $3=控制台端口
+  local f="$1" api="$2" con="$3"
+  [ -f "${f}" ] || return 1
+  case "${api}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${con}" in ''|*[!0-9]*) return 1 ;; esac
+  sed -i "s|^\([[:space:]]*-[[:space:]]*\)\"[^\"]*:9000\"|\1\"${api}:9000\"|" "${f}" 2>/dev/null || return 1
+  sed -i "s|^\([[:space:]]*-[[:space:]]*\)\"[^\"]*:9001\"|\1\"${con}:9001\"|" "${f}" 2>/dev/null || return 1
+  return 0
+}
+
+
+# 把真实 API 端口渲染进 gateway.conf 的注入脚本（幂等：按 `var p = <数字>;` 重写）。
+# 为什么需要：窗口内打开时，页面要替用户把「服务器地址」写进 localStorage，端口必须是对的
+# （真源是 settings.env 的 API_PORT；渲染后 gateway 容器挂载的这份配置即生效于新请求）。
+render_gateway_conf() { # $1=gateway.conf 路径  $2=API 端口
+  local f="$1" api="$2" n_before n_after
+  [ -f "${f}" ] || return 1
+  case "${api}" in ''|*[!0-9]*) return 1 ;; esac
+
+  # 形态契约（真机踩过，别改）：端口必须写成「单独一条语句、分号结尾」的 `var p = <数字>;`。
+  # 逗号连写（`var k=...,p = 9200,...`）JS 语义等价，但本函数的正则匹配不到 →
+  # 渲染静默不做 → **装出来的端口会停在模板值**（这类“看起来只是排版”的差异最难查）。
+  # 所以这里先探一次：数量为 0 时区分「文件不对」和「写法不对」，后者给出可操作提示。
+  n_before="$(grep -o 'var p = [0-9]*;' "${f}" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n_before:-0}" -eq 0 ]; then
+    if grep -v '^[[:space:]]*#' "${f}" 2>/dev/null | grep -Eq 'p = [0-9]+[,)]'; then
+      warn "gateway.conf 的端口写成了逗号形态（p = <数字>,）—— 渲染只认「单独一条语句、分号结尾」的 var p = <数字>;，
+  当前写法不会被替换，端口会停在模板值（不是 ${api}）。请把注入脚本改回：
+    var p = <数字>;var k=\"rustfs-server-host\",s=window.localStorage,h=location.hostname;…
+  （逗号连写只是排版差异，但会让本函数完全失效。）"
+    fi
+    return 1                                        # 一个都没有 → 文件形态不对
+  fi
+
+  # 全量替换：注入脚本在多个精确 location 里各有一份，统计出现次数（不是行数）并全部替换。
+  sed -i -E "s/(var p = )[0-9]+;/\1${api};/g" "${f}" 2>/dev/null || return 1
+  n_after="$(grep -o "var p = ${api};" "${f}" 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${n_after}" = "${n_before}" ] || return 1      # 有漏替换 → 报错，别静默
+
+  # 零残留：目标端口不是模板值 9200 时，渲染后不该再出现模板值（防止“部分替换”）
+  if [ "${api}" != "9200" ] && grep -q 'var p = 9200;' "${f}" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
 probe_writable() { # $1=已存在的目录；0=可写 1=不可写
   local dir="$1" p cur_uid target_uid target_gid
   [ -d "${dir}" ] || return 1
@@ -329,13 +400,32 @@ fi
 data_dir_mode="$(derive_data_mode "${data_dir}" "${link_path}")"
 
 # 其它会影响容器运行、需要重建的项：控制台端口 / 日志级别 / 控制台开关 / 数据子目录
+new_api_port="$(resolve_api_port)"
 new_console_port="${wizard_console_port:-${CONSOLE_PORT:-9201}}"
+case "${new_api_port}" in ''|*[!0-9]*) fail "S3 API 端口非法：${new_api_port}" ;; esac
+case "${new_console_port}" in ''|*[!0-9]*) fail "控制台端口非法：${new_console_port}" ;; esac
+[ "${new_api_port}" != "${new_console_port}" ] \
+  || fail "S3 API 端口与控制台端口不能相同（都是 ${new_api_port}）。"
 new_log_level="${wizard_log_level:-${LOG_LEVEL:-error}}"
 new_console_enable="${wizard_console_enable:-${CONSOLE_ENABLE:-true}}"
+# CORS 允许源：改了必须重建容器（env 变化不会热生效），否则用户填了正确源也不生效。
+new_cors_origins="${wizard_cors_origins:-${CORS_ORIGINS:-*}}"
+# 基本形态校验：允许空（回退 *），否则必须是 http(s)://host[:port]，多个用逗号分隔
+case "${new_cors_origins}" in
+  ''|'*') new_cors_origins="${new_cors_origins:-*}" ;;
+  *)
+    if ! printf '%s' "${new_cors_origins}" | grep -Eq '^https?://[A-Za-z0-9.-]+(:[0-9]+)?(,[[:space:]]*https?://[A-Za-z0-9.-]+(:[0-9]+)?)*$'; then
+      fail "「允许的来源」格式不对：${new_cors_origins}
+  正确写法：http://192.168.1.10:5666 或多个用逗号分隔；留空表示允许所有来源。
+  本次没有改动任何配置。"
+    fi ;;
+esac
 meta_changed=0
+[ "${new_api_port}"       != "${API_PORT:-9200}" ]         && meta_changed=1
 [ "${new_console_port}"   != "${CONSOLE_PORT:-9201}" ]     && meta_changed=1
 [ "${new_log_level}"      != "${LOG_LEVEL:-error}" ]       && meta_changed=1
 [ "${new_console_enable}" != "${CONSOLE_ENABLE:-true}" ]   && meta_changed=1
+[ "${new_cors_origins}"   != "${CORS_ORIGINS:-*}" ]        && meta_changed=1
 [ "${data_subdir}"        != "${DATA_SUBDIR:-data}" ]      && meta_changed=1
 
 # ---------------------------------------------------------------------------
@@ -364,13 +454,14 @@ if [ -n "${ak_in}" ] || [ -n "${sk_in}" ]; then
 fi
 
 cat >"${SETTINGS}" <<EOF
-API_PORT=${TRIM_SERVICE_PORT:-9200}
-CONSOLE_PORT=${wizard_console_port:-9201}
+API_PORT=${new_api_port}
+CONSOLE_PORT=${new_console_port}
 DATA_SUBDIR=${data_subdir}
 DATA_DIR=${data_dir}
 DATA_DIR_MODE=${data_dir_mode}
-LOG_LEVEL=${wizard_log_level:-error}
-CONSOLE_ENABLE=${wizard_console_enable:-true}
+LOG_LEVEL=${new_log_level}
+CONSOLE_ENABLE=${new_console_enable}
+CORS_ORIGINS=${new_cors_origins}
 CRED_SOURCE=${CRED_SOURCE:-keep}
 EOF
 chmod 600 "${SETTINGS}" 2>/dev/null || true
@@ -392,8 +483,8 @@ fi
 # 全部没变就不重建：`compose up --force-recreate` 会真的重启容器（服务中断十几秒），
 # 用户在设置页点一下「保存」却什么都没改时，不该付这个代价（真机第十一轮 #2）。
 if [ "${data_changed}" = "0" ] && [ "${cred_changed}" = "0" ] && [ "${meta_changed}" = "0" ]; then
-  say "配置无变化，未重建容器（数据目录：${data_dir}；S3 端口 ${TRIM_SERVICE_PORT:-9200}；控制台端口 ${new_console_port}）"
-  if probe_ready "${TRIM_SERVICE_PORT:-9200}"; then
+  say "配置无变化，未重建容器（数据目录：${data_dir}；S3 端口 ${new_api_port}；控制台端口 ${new_console_port}）"
+  if probe_ready "${new_api_port}"; then
     trace "config_callback no-op data_dir=${data_dir} mode=${data_dir_mode}"
     exit 0
   fi
@@ -401,7 +492,16 @@ if [ "${data_changed}" = "0" ] && [ "${cred_changed}" = "0" ] && [ "${meta_chang
   请在应用中心「停止 → 启动」一次；仍不行请查看 docker logs ${CONTAINER}。"
 fi
 
-# 重建容器：卷指向与 env 都不会热生效
+# 端口是渲染进 compose 的（不是插值），所以重建前必须先重渲染。
+# 重建同样不带服务名 → gateway 会一起重建（改端口/前缀时必须如此，否则 socket 还挂在旧端口上）。
+# 就绪判定只探 RustFS，不因 gateway 慢而失败。
+render_compose_ports "${COMPOSE_FILE}" "${new_api_port}" "${new_console_port}" \
+  || fail "无法把端口写入 compose（${COMPOSE_FILE}）。本次没有改动任何数据。"
+# 端口变了，gateway.conf 里的注入脚本也要跟着改（否则窗口内仍会写入旧端口）
+render_gateway_conf "${TRIM_APPDEST}/docker/gateway.conf" "${new_api_port}" \
+  || warn "无法把 API 端口写进 gateway.conf 的注入脚本（窗口内打开时可能需要手填一次服务器地址）。"
+
+# 重建容器：卷指向、env、ports 都不会热生效
 if ! compose up -d --no-deps --force-recreate >/dev/null 2>&1; then
   # 回滚配置与凭据后重试一次
   printf '%s' "${old_settings}" >"${SETTINGS}" 2>/dev/null || true
@@ -425,7 +525,7 @@ if [ -n "${moved_notice}" ]; then
 EOF
 fi
 
-if wait_ready "${TRIM_SERVICE_PORT:-9200}" 180; then
+if wait_ready "${new_api_port}" 180; then
   say "配置已生效，实例就绪。数据目录：${data_dir}"
   trace "config_callback ok data_dir=${data_dir} cred_changed=${cred_changed}"
   exit 0

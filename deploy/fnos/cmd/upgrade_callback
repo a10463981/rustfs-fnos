@@ -50,6 +50,52 @@ wait_ready() {
   return 1
 }
 
+# API 端口的唯一真源是 settings.env 的 API_PORT（用户可能在向导里改过）：
+#   优先级 API_PORT → TRIM_SERVICE_PORT → 9200。
+# 不能只用 TRIM_SERVICE_PORT —— 那是 manifest.service_port 的静态值，用户改成 9300 后它就过时了。
+# 把真实 API 端口渲染进 gateway.conf 的注入脚本（幂等；升级会替换 APPDEST 里的模板，必须重跑）
+render_gateway_conf() { # $1=gateway.conf 路径  $2=API 端口
+  local f="$1" api="$2" n_before n_after
+  [ -f "${f}" ] || return 1
+  case "${api}" in ''|*[!0-9]*) return 1 ;; esac
+
+  # 形态契约（真机踩过，别改）：端口必须写成「单独一条语句、分号结尾」的 `var p = <数字>;`。
+  # 逗号连写（`var k=...,p = 9200,...`）JS 语义等价，但本函数的正则匹配不到 →
+  # 渲染静默不做 → **装出来的端口会停在模板值**（这类“看起来只是排版”的差异最难查）。
+  # 所以这里先探一次：数量为 0 时区分「文件不对」和「写法不对」，后者给出可操作提示。
+  n_before="$(grep -o 'var p = [0-9]*;' "${f}" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${n_before:-0}" -eq 0 ]; then
+    if grep -v '^[[:space:]]*#' "${f}" 2>/dev/null | grep -Eq 'p = [0-9]+[,)]'; then
+      warn "gateway.conf 的端口写成了逗号形态（p = <数字>,）—— 渲染只认「单独一条语句、分号结尾」的 var p = <数字>;，
+  当前写法不会被替换，端口会停在模板值（不是 ${api}）。请把注入脚本改回：
+    var p = <数字>;var k=\"rustfs-server-host\",s=window.localStorage,h=location.hostname;…
+  （逗号连写只是排版差异，但会让本函数完全失效。）"
+    fi
+    return 1                                        # 一个都没有 → 文件形态不对
+  fi
+
+  # 全量替换：注入脚本在多个精确 location 里各有一份，统计出现次数（不是行数）并全部替换。
+  sed -i -E "s/(var p = )[0-9]+;/\1${api};/g" "${f}" 2>/dev/null || return 1
+  n_after="$(grep -o "var p = ${api};" "${f}" 2>/dev/null | wc -l | tr -d ' ')"
+  [ "${n_after}" = "${n_before}" ] || return 1      # 有漏替换 → 报错，别静默
+
+  # 零残留：目标端口不是模板值 9200 时，渲染后不该再出现模板值（防止“部分替换”）
+  if [ "${api}" != "9200" ] && grep -q 'var p = 9200;' "${f}" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+api_port_resolved() {
+  local p=""
+  if [ -r "${SETTINGS}" ]; then
+    p="$(awk -F= '/^[[:space:]]*API_PORT[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "${SETTINGS}" 2>/dev/null)"
+  fi
+  [ -n "${p}" ] || p="${TRIM_SERVICE_PORT:-9200}"
+  case "${p}" in ''|*[!0-9]*) p=9200 ;; esac
+  printf '%s' "${p}"
+}
+
 image_id() { docker image inspect "$1" --format '{{.Id}}' 2>/dev/null || true; }
 container_image_id() { docker inspect -f '{{.Image}}' "${CONTAINER}" 2>/dev/null || true; }
 
@@ -85,7 +131,7 @@ rollback_and_fail() {
   compose up -d --no-deps --force-recreate --remove-orphans >>"${VAR_DIR}/lifecycle.log" 2>&1 \
     || fail "${reason}；回滚重建容器失败，请人工介入（镜像 ${prev_ref}）。"
 
-  if wait_ready "${API_PORT:-9200}" 180; then
+  if wait_ready "$(api_port_resolved)" 180; then
     got="$(container_image_id)"
     fail "${reason}。已回滚到 ${prev_ref}（当前 image id ${got:-unknown}${prev_id:+，升级前为 ${prev_id}}）并恢复就绪。请查 ${VAR_DIR}/lifecycle.log 与 docker logs ${CONTAINER}。"
   fi
@@ -136,7 +182,11 @@ say "目标镜像已在本地：${new_image}（image id ${target_id}）"
 compose up -d --no-deps --force-recreate --remove-orphans >>"${VAR_DIR}/lifecycle.log" 2>&1 \
   || rollback_and_fail "重建容器失败（docker compose up）"
 
-wait_ready "${API_PORT:-9200}" 180 || rollback_and_fail "升级后 180s 内未就绪（${new_image}）"
+render_gateway_conf "${TRIM_APPDEST}/docker/gateway.conf" "$(api_port_resolved)" \
+  || warn "升级后无法把 API 端口写进 gateway.conf 的注入脚本（窗口内打开时可能需要手填一次服务器地址）。"
+compose up -d --no-deps gateway >/dev/null 2>&1 || warn "gateway 未随升级重建（窗口内打开可能受影响，可点一次「停止→启动」）。"
+
+wait_ready "$(api_port_resolved)" 180 || rollback_and_fail "升级后 180s 内未就绪（${new_image}）"
 
 got_id="$(container_image_id)"
 if [ -z "${got_id}" ]; then
