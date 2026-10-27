@@ -1,0 +1,113 @@
+#!/bin/bash
+
+APP_NAME=rustfs-fnos
+CONTAINER=rustfs-fnos
+COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+SETTINGS="${CFG_DIR}/settings.env"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+API_PORT="${TRIM_SERVICE_PORT:-9200}"
+
+compose() { docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" "$@"; }
+
+say() { echo "[${APP_NAME}] $*"; }
+
+# 告警 / 失败 / 日志：重定向整体包进 { …; }，避免日志文件不可写时 bash 往 stderr 抛错
+warn() {
+  { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}"; } 2>/dev/null || true
+  echo "[${APP_NAME}] WARN: $*" >&2
+}
+
+fail() {
+  { echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}"; } 2>/dev/null || true
+  echo "[${APP_NAME}] ERROR: $*" >&2
+  exit 1
+}
+
+trace() {
+  { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log"; } 2>/dev/null || true
+}
+
+probe_ready() {
+  local url="http://127.0.0.1:$1/health/ready"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 5 "$url" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q -T 5 -O /dev/null "$url" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  return 1
+}
+
+wait_ready() {
+  local port="$1" timeout_s="${2:-180}" waited=0
+  while [ "${waited}" -lt "${timeout_s}" ]; do
+    probe_ready "${port}" && return 0
+    sleep 3
+    waited=$((waited + 3))
+  done
+  return 1
+}
+
+image_id() { docker image inspect "$1" --format '{{.Id}}' 2>/dev/null || true; }
+container_image_id() { docker inspect -f '{{.Image}}' "${CONTAINER}" 2>/dev/null || true; }
+
+# 升级前：记录「容器实际在用的引用 + 真实运行 id」、确认健康、备份 etc
+trace "upgrade_init begin old=${TRIM_OLD_APPVER:-unknown} new=${TRIM_APPVER:-unknown}"
+
+compose_ref="$(awk -F'image:' '/^[[:space:]]*image:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "${COMPOSE_FILE}" 2>/dev/null)"
+[ -n "${compose_ref}" ] || fail "无法从 compose 解析当前镜像，已中止升级（${COMPOSE_FILE}）。"
+
+container_ref="$(docker inspect -f '{{.Config.Image}}' "${CONTAINER}" 2>/dev/null || true)"
+running_id="$(container_image_id)"
+ref_id="$(image_id "${compose_ref}")"
+
+# 回滚基准以「运行中容器」为准：
+#   ① compose 文件在升级过程中会被替换，它不是稳定基准；
+#   ② 容器的 Config.Image 才是它**实际在用**的引用——真机第四轮踩过：
+#      compose 写 1.0.4、容器跑 preview.15，只记 compose 会让回滚提示去拉一个错的 tag。
+prev_ref="${container_ref:-${compose_ref}}"
+prev_image_id="${running_id:-${ref_id}}"
+
+if [ -n "${container_ref}" ] && [ -n "${compose_ref}" ] && [ "${container_ref}" != "${compose_ref}" ]; then
+  warn "compose 声明（${compose_ref}）与容器实际在用（${container_ref}）不一致：回滚以容器为准。"
+  warn "  compose 声明 → ${compose_ref}（本地 id=${ref_id:-无此镜像}）"
+  warn "  容器实际   → ${container_ref}（容器 id=${running_id:-未获取}）"
+fi
+if [ -z "${ref_id}" ]; then
+  warn "compose 声明的镜像 ${compose_ref} 不在本地（可能被 docker image prune 清理）。若回滚落在它上面，需管理员以 root 执行 docker pull ${compose_ref}。"
+fi
+if [ -z "${running_id}" ]; then
+  warn "无法读取容器镜像 id（容器可能未运行）；回滚基准降级为 compose 引用对应的本地镜像。"
+fi
+
+printf '%s\n' "${prev_ref}"      >"${CFG_DIR}/previous_image"    || fail "写入 ${CFG_DIR}/previous_image 失败。"
+printf '%s\n' "${prev_image_id}" >"${CFG_DIR}/previous_image_id" || fail "写入 ${CFG_DIR}/previous_image_id 失败。"
+printf '%s\n' "${compose_ref}"   >"${CFG_DIR}/previous_image_compose" || warn "写入 previous_image_compose 失败（仅审计用途）。"
+chmod 600 "${CFG_DIR}/previous_image" "${CFG_DIR}/previous_image_id" "${CFG_DIR}/previous_image_compose" 2>/dev/null || true
+
+say "升级前容器实际镜像：${prev_ref}"
+say "  compose 声明：${compose_ref}（本地 id=${ref_id:-<无>}）"
+say "  容器镜像 id ：${running_id:-<未运行>}"
+say "  回滚基准    ：${prev_ref} / ${prev_image_id:-<未知>}"
+trace "upgrade_init ref=${prev_ref} compose_ref=${compose_ref} ref_id=${ref_id:-none} container_id=${running_id:-none} baseline=${prev_image_id:-none}"
+
+# 升级前必须健康
+if [ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null)" = "true" ]; then
+  probe_ready "${API_PORT:-9200}" || fail "当前实例未就绪（/health/ready 非 200），请先排查（docker logs ${CONTAINER}）再升级。"
+fi
+
+mkdir -p "${TRIM_PKGTMP}" 2>/dev/null || true
+bak="${TRIM_PKGTMP}/etc-backup-${TRIM_APPVER:-new}.tgz"
+tar -czf "${bak}" -C "${CFG_DIR}" . >/dev/null 2>&1 || warn "备份 ${CFG_DIR} 失败（继续升级）。"
+[ -f "${bak}" ] && say "已备份配置到 ${bak}"
+
+old_minor="$(printf '%s' "${TRIM_OLD_APPVER:-}" | cut -d. -f1-2)"
+new_minor="$(printf '%s' "${TRIM_APPVER:-}"     | cut -d. -f1-2)"
+if [ -n "${old_minor}" ] && [ -n "${new_minor}" ] && [ "${old_minor}" != "${new_minor}" ]; then
+  warn "本次为跨 minor 升级（${TRIM_OLD_APPVER} → ${TRIM_APPVER}），RustFS 未承诺 on-disk 格式向后兼容，请先备份数据目录。"
+fi
+
+trace "upgrade_init ok"
+exit 0

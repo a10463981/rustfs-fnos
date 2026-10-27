@@ -1,0 +1,153 @@
+#!/bin/bash
+
+APP_NAME=rustfs-fnos
+CONTAINER=rustfs-fnos
+COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+SETTINGS="${CFG_DIR}/settings.env"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+API_PORT="${TRIM_SERVICE_PORT:-9200}"
+
+compose() { docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" "$@"; }
+
+say() { echo "[${APP_NAME}] $*"; }
+
+# 告警 / 失败 / 日志：重定向整体包进 { …; }，避免日志文件不可写时 bash 往 stderr 抛错
+warn() {
+  { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}"; } 2>/dev/null || true
+  echo "[${APP_NAME}] WARN: $*" >&2
+}
+
+fail() {
+  { echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}"; } 2>/dev/null || true
+  echo "[${APP_NAME}] ERROR: $*" >&2
+  exit 1
+}
+
+trace() {
+  { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log"; } 2>/dev/null || true
+}
+
+probe_ready() {
+  local url="http://127.0.0.1:$1/health/ready"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 5 "$url" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q -T 5 -O /dev/null "$url" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  return 1
+}
+
+wait_ready() {
+  local port="$1" timeout_s="${2:-180}" waited=0
+  while [ "${waited}" -lt "${timeout_s}" ]; do
+    probe_ready "${port}" && return 0
+    sleep 3
+    waited=$((waited + 3))
+  done
+  return 1
+}
+
+image_id() { docker image inspect "$1" --format '{{.Id}}' 2>/dev/null || true; }
+container_image_id() { docker inspect -f '{{.Image}}' "${CONTAINER}" 2>/dev/null || true; }
+
+PREV_IMAGE_FILE="${CFG_DIR}/previous_image"
+PREV_IMAGE_ID_FILE="${CFG_DIR}/previous_image_id"
+PENDING="${CFG_DIR}/pending_verify.env"
+HISTORY_FILE="${CFG_DIR}/upgrade-history.log"
+
+write_history() { # $1=ref $2=id
+  {
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${TRIM_OLD_APPVER:-unknown}" "${TRIM_APPVER:-unknown}" "$1" "$2"
+  } >>"${HISTORY_FILE}" 2>/dev/null || warn "写入 ${HISTORY_FILE} 失败（不影响升级结果）。"
+  chmod 600 "${HISTORY_FILE}" 2>/dev/null || true
+}
+
+# 回滚到升级前镜像。包用户不能拉镜像（无签名头），所以只能依赖本地已有镜像；
+# 本地没有就明确交回给管理员，别假装能自动回滚。
+rollback_and_fail() {
+  local reason="$1" prev_ref prev_id got
+  prev_ref="$(head -n1 "${PREV_IMAGE_FILE}" 2>/dev/null | tr -d '[:space:]')"
+  prev_id="$(head -n1 "${PREV_IMAGE_ID_FILE}" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "${prev_ref}" ] || fail "${reason}；且未记录到上一版镜像，无法自动回滚。请人工处理：docker logs ${CONTAINER}"
+
+  if [ -z "$(image_id "${prev_ref}")" ]; then
+    fail "${reason}。回滚未能执行：上一版镜像 ${prev_ref} 不在本地（可能已被清理），而包用户无法自行拉取（镜像站签名头只在 root 的 docker 配置里）。请由管理员执行：docker pull ${prev_ref} && sed -i 's|^\\([[:space:]]*image:[[:space:]]*\\).*|\\1${prev_ref}|' "${COMPOSE_FILE}" && TRIM_UID=$(id -u) TRIM_GID=$(id -g) docker compose -p ${APP_NAME} -f "${COMPOSE_FILE}" up -d --no-deps"
+  fi
+
+  say "开始回滚到 ${prev_ref} ……"
+  cp -f "${COMPOSE_FILE}" "${COMPOSE_FILE}.upgrade-bak" 2>/dev/null || true
+  sed -i "s#^\\([[:space:]]*image:[[:space:]]*\\).*#\\1${prev_ref}#" "${COMPOSE_FILE}" \
+    || fail "${reason}；改写 compose 回滚失败，请手动把 image 改回 ${prev_ref} 后 docker compose up -d --no-deps。"
+  compose up -d --no-deps --force-recreate --remove-orphans >>"${VAR_DIR}/lifecycle.log" 2>&1 \
+    || fail "${reason}；回滚重建容器失败，请人工介入（镜像 ${prev_ref}）。"
+
+  if wait_ready "${API_PORT:-9200}" 180; then
+    got="$(container_image_id)"
+    fail "${reason}。已回滚到 ${prev_ref}（当前 image id ${got:-unknown}${prev_id:+，升级前为 ${prev_id}}）并恢复就绪。请查 ${VAR_DIR}/lifecycle.log 与 docker logs ${CONTAINER}。"
+  fi
+  fail "${reason}；回滚后仍未就绪，请立即人工介入：docker logs ${CONTAINER}"
+}
+
+# 升级后：不自己拉镜像（包用户必然失败），只做两件事：
+#  A) 目标镜像已在本地 → 立刻重建并校验容器 id，能当场判定成败；
+#  B) 目标镜像不在本地 → 写待校验标记，交给 root 侧（应用中心启动/compose up）拉取，
+#     由 cmd/main 的 status 在容器真正起来之后校验，不静默放过。
+trace "upgrade_callback begin ver=${TRIM_APPVER:-unknown}"
+[ -f "${COMPOSE_FILE}" ] || fail "compose 文件缺失：${COMPOSE_FILE}"
+
+# 回滚要改 compose、要写 .upgrade-bak：不可写就没法兜底，提前判死
+if [ ! -w "${COMPOSE_FILE}" ]; then
+  fail "程序目录不可写（${COMPOSE_FILE}），失败时无法回滚，升级已中止。请管理员检查 /vol*/@appcenter/${APP_NAME} 的属主是否为包用户。"
+fi
+
+new_image="$(awk -F'image:' '/^[[:space:]]*image:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "${COMPOSE_FILE}" 2>/dev/null)"
+[ -n "${new_image}" ] || fail "无法从 compose 解析目标镜像，升级已中止。"
+prev_ref="$(head -n1 "${PREV_IMAGE_FILE}" 2>/dev/null | tr -d '[:space:]')"
+say "目标镜像：${new_image}"
+[ -n "${prev_ref}" ] && say "升级前镜像：${prev_ref}"
+
+target_id="$(image_id "${new_image}")"
+
+if [ -z "${target_id}" ]; then
+  # ---- B) 目标镜像还没到本地：写待校验标记，交给 root 侧拉取 ----
+  mkdir -p "${CFG_DIR}" 2>/dev/null || true
+  cat >"${PENDING}" <<EOF
+TARGET_REF=${new_image}
+FROM_VERSION=${TRIM_OLD_APPVER:-unknown}
+TO_VERSION=${TRIM_APPVER:-unknown}
+CREATED_TS=$(date '+%Y-%m-%dT%H:%M:%S%z')
+ATTEMPTS=0
+DEADLINE_ATTEMPTS=20
+EOF
+  chmod 600 "${PENDING}" 2>/dev/null || true
+  trace "upgrade_callback pending ref=${new_image} (image not local yet)"
+  say "目标镜像尚未落到本地：${new_image}"
+  say "本应用以包用户运行，没有 fnOS 镜像站的签名头（该签名头只在 root 的 docker 配置里），无法自行拉取——这是平台设计，不是故障。"
+  say "已登记「待校验升级」：镜像将由应用中心在启动阶段以 root 身份拉取；容器起来之后由应用状态检查校验镜像 id，不匹配会明确报失败（不会静默按新版本运行旧镜像）。"
+  exit 0
+fi
+
+# ---- A) 目标镜像已在本地：重建 + 当场校验 ----
+say "目标镜像已在本地：${new_image}（image id ${target_id}）"
+compose up -d --no-deps --force-recreate --remove-orphans >>"${VAR_DIR}/lifecycle.log" 2>&1 \
+  || rollback_and_fail "重建容器失败（docker compose up）"
+
+wait_ready "${API_PORT:-9200}" 180 || rollback_and_fail "升级后 180s 内未就绪（${new_image}）"
+
+got_id="$(container_image_id)"
+if [ -z "${got_id}" ]; then
+  rollback_and_fail "无法读取容器实际使用的镜像 id（docker inspect 失败），无法确认升级是否生效"
+fi
+if [ "${got_id}" != "${target_id}" ]; then
+  rollback_and_fail "容器实际镜像 id（${got_id}）与目标（${target_id}）不一致：升级未真正生效"
+fi
+
+write_history "${new_image}" "${got_id}"
+rm -f "${PENDING}" 2>/dev/null || true
+say "升级完成：${new_image}（image id ${got_id}），实例已就绪。"
+trace "upgrade_callback ok ref=${new_image} id=${got_id}"
+exit 0

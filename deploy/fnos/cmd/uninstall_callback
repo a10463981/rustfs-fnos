@@ -1,0 +1,98 @@
+#!/bin/bash
+
+APP_NAME=rustfs-fnos
+CONTAINER=rustfs-fnos
+COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+CRED_DIR="${CFG_DIR}/credentials"
+SETTINGS="${CFG_DIR}/settings.env"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+API_PORT="${TRIM_SERVICE_PORT:-9200}"
+
+compose() { docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" "$@"; }
+
+say() { echo "[${APP_NAME}] $*"; }
+
+# 失败：既要让管理员在终端看见，也要写进 TRIM_TEMP_LOGFILE 让应用中心显示原因
+fail() {
+  echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}" 2>/dev/null || true
+  echo "[${APP_NAME}] ERROR: $*" >&2
+  exit 1
+}
+
+trace() {
+  mkdir -p "${VAR_DIR}" 2>/dev/null || true
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log" 2>/dev/null || true
+}
+
+read_settings() {
+  if [ -r "${SETTINGS}" ]; then
+    # shellcheck disable=SC1090
+    . "${SETTINGS}"
+  fi
+}
+
+# 卸载后：停容器（严禁 -v）、按用户选择处理数据
+# 关键安全边界：数据处理只针对「应用自己目录里」的默认数据位置。
+# 若数据在用户自己的存储空间（DATA_DIR 不在 ${VAR_DIR} 内），**任何情况下都不动它**。
+trace "uninstall_callback begin action=${wizard_data_action:-${data_action:-keep}}"
+action="${wizard_data_action:-${data_action:-keep}}"
+read_settings
+
+if [ -f "${COMPOSE_FILE}" ] && docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" version >/dev/null 2>&1; then
+  # 明确不带 -v：本项目数据是 bind mount，带 -v 是给自己留后患
+  compose down --remove-orphans >/dev/null 2>&1 || say "警告：docker compose down 失败（可忽略，继续清理选择）。"
+fi
+
+data_subdir="${DATA_SUBDIR:-data}"
+link_path="${VAR_DIR}/${data_subdir}"
+data_dir="${DATA_DIR:-${link_path}}"
+
+# 判定数据是否在「应用自己的目录」内（决定卸载时能不能碰它）
+data_is_internal=0
+case "$(readlink -f "${data_dir}" 2>/dev/null || echo "${data_dir}")/" in
+  "$(readlink -f "${VAR_DIR}" 2>/dev/null || echo "${VAR_DIR}")"/*) data_is_internal=1 ;;
+esac
+
+if [ "${data_is_internal}" != "1" ]; then
+  # 用户自己的存储空间：不删、不改名、不统计，只把位置告诉他们
+  say "数据存放在你的存储空间里：${data_dir}"
+  say "卸载不会删除这里的任何数据；重新安装时把它填回安装向导的「数据存放目录」即可继续用。"
+  echo "[${APP_NAME}] 数据在用户目录 ${data_dir}，卸载未触碰（action=${action} 对用户目录无效）" >>"${LOG_FILE}" 2>/dev/null || true
+  # 只摘掉指向它的软链（链接本身在应用目录里），绝不动目标
+  if [ -L "${link_path}" ]; then
+    rm -f "${link_path}" 2>/dev/null || true
+    say "已移除应用目录里的数据目录链接（不影响 ${data_dir} 里的数据）。"
+  fi
+else
+  if [ "${action}" = "delete" ]; then
+    ts="$(date '+%Y%m%d%H%M%S')"
+    for d in "${link_path}" "${VAR_DIR}/logs"; do
+      [ -e "${d}" ] || continue
+      # 只用 rm -rf 处理真实目录；若发现是链接，先摘链接（避免顺着链接删到别处）
+      if [ -L "${d}" ]; then rm -f "${d}" 2>/dev/null || true; continue; fi
+      mv "${d}" "${d}.deleted.${ts}" 2>/dev/null || rm -rf "${d}" 2>/dev/null || true
+      rm -rf "${d}.deleted.${ts}" 2>/dev/null || true
+    done
+    say "已删除对象数据与日志（原路径 ${link_path}）。"
+    echo "[${APP_NAME}] 已按用户选择删除数据目录 ${link_path}" >>"${LOG_FILE}" 2>/dev/null || true
+  else
+    say "已保留数据目录 ${link_path}；重新安装会继续沿用。"
+    echo "[${APP_NAME}] 已保留数据目录 ${link_path}" >>"${LOG_FILE}" 2>/dev/null || true
+  fi
+fi
+
+# 凭据属于敏感物，卸载后一律清除（重新安装时按向导重新设定）
+rm -f "${CRED_DIR}/access_key" "${CRED_DIR}/secret_key" 2>/dev/null || true
+rmdir "${CRED_DIR}" 2>/dev/null || true
+# 平台卸载时可能把「本应用引用的镜像 tag」一并移除（真机：卸载后 1.0.4 消失、只剩 latest）。
+# 我们不做任何保 tag 的动作（会留下没人清理的垃圾镜像），只在日志里留一句可执行的提示。
+image_ref="$(awk -F'image:' '/^[[:space:]]*image:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "${COMPOSE_FILE}" 2>/dev/null)"
+if [ -n "${image_ref}" ]; then
+  say "提示：应用卸载后，镜像 tag ${image_ref} 可能被平台移除（镜像层若被其它 tag 引用则仍保留）。"
+  say "      重新安装前如果它不在了，先执行 sudo docker pull ${image_ref} 再装，否则首次启动会等镜像。"
+  echo "[${APP_NAME}] 卸载提示：重装前请确认本地仍有 ${image_ref}（sudo docker images | grep rustfs）" >>"${LOG_FILE}" 2>/dev/null || true
+fi
+trace "uninstall_callback ok internal=${data_is_internal} action=${action}"
+exit 0

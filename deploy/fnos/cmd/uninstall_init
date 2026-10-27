@@ -1,0 +1,82 @@
+#!/bin/bash
+
+APP_NAME=rustfs-fnos
+CONTAINER=rustfs-fnos
+COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+CRED_DIR="${CFG_DIR}/credentials"
+SETTINGS="${CFG_DIR}/settings.env"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+API_PORT="${TRIM_SERVICE_PORT:-9200}"
+
+compose() { docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" "$@"; }
+
+say() { echo "[${APP_NAME}] $*"; }
+
+# 失败：既要让管理员在终端看见，也要写进 TRIM_TEMP_LOGFILE 让应用中心显示原因
+fail() {
+  echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}" 2>/dev/null || true
+  echo "[${APP_NAME}] ERROR: $*" >&2
+  exit 1
+}
+
+trace() {
+  mkdir -p "${VAR_DIR}" 2>/dev/null || true
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log" 2>/dev/null || true
+}
+
+# 宿主侧探针（不依赖镜像内工具）；200 才算就绪
+probe_ready() {
+  local url="http://127.0.0.1:$1/health/ready"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 5 "$url" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q -T 5 -O /dev/null "$url" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  return 1
+}
+
+wait_ready() {
+  local port="$1" timeout="${2:-180}" waited=0
+  while [ "${waited}" -lt "${timeout}" ]; do
+    probe_ready "${port}" && return 0
+    sleep 3
+    waited=$((waited + 3))
+  done
+  return 1
+}
+
+read_settings() {
+  if [ -r "${SETTINGS}" ]; then
+    # shellcheck disable=SC1090
+    . "${SETTINGS}"
+  fi
+}
+
+# 卸载前：只读取用户选择，不做任何破坏性动作
+trace "uninstall_init begin action=${wizard_data_action:-${data_action:-keep}}"
+action="${wizard_data_action:-${data_action:-keep}}"
+read_settings   # 不读 settings.env 就拿不到用户自定义的 DATA_DIR
+
+# 数据可能在两处：应用默认位置（会被下面选择影响），或用户自己的存储空间（永远不动）
+data_subdir="${DATA_SUBDIR:-data}"
+link_path="${VAR_DIR}/${data_subdir}"
+data_dir="${DATA_DIR:-${link_path}}"
+data_is_internal=0
+case "$(readlink -f "${data_dir}" 2>/dev/null || echo "${data_dir}")/" in
+  "$(readlink -f "${VAR_DIR}" 2>/dev/null || echo "${VAR_DIR}")"/*) data_is_internal=1 ;;
+esac
+
+if [ "${data_is_internal}" = "1" ]; then
+  case "${action}" in
+    keep)   say "卸载后将保留数据目录：${link_path}" ;;
+    delete) say "卸载后将删除数据目录：${link_path}（不可恢复）" ;;
+    *)      say "未识别的数据处理选择（${action}），按「保留数据」处理。" ;;
+  esac
+else
+  say "你的数据目录：${data_dir}"
+  say "它在你的存储空间里，不属于应用目录 —— 无论上面选什么，卸载都不会删除它。"
+fi
+exit 0

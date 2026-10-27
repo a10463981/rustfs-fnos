@@ -1,0 +1,326 @@
+#!/bin/bash
+
+APP_NAME=rustfs-fnos
+CONTAINER=rustfs-fnos
+COMPOSE_FILE="${TRIM_APPDEST}/docker/docker-compose.yaml"
+CFG_DIR="${TRIM_PKGETC}"
+VAR_DIR="${TRIM_PKGVAR}"
+SETTINGS="${CFG_DIR}/settings.env"
+LOG_FILE="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+API_PORT="${TRIM_SERVICE_PORT:-9200}"
+
+PENDING="${CFG_DIR}/pending_verify.env"
+PREV_IMAGE_FILE="${CFG_DIR}/previous_image"
+PREV_IMAGE_ID_FILE="${CFG_DIR}/previous_image_id"
+HISTORY_FILE="${CFG_DIR}/upgrade-history.log"
+# 待校验的宽限期按「墙钟时间」算，不按状态检查次数：
+# 真机实测连跑 20 次 status 只要 3 秒，按次数会在镜像还没拉完时判死。
+DEADLINE_MINUTES_DEFAULT=15
+
+compose() { docker compose -p "${APP_NAME}" -f "${COMPOSE_FILE}" "$@"; }
+
+say() { echo "[${APP_NAME}] $*"; }
+
+# 告警 / 失败 / 日志：重定向整体包进 { …; }，避免日志文件不可写时 bash 往 stderr 抛错
+warn() {
+  { echo "[${APP_NAME}] WARN: $*" >>"${LOG_FILE}"; } 2>/dev/null || true
+  echo "[${APP_NAME}] WARN: $*" >&2
+}
+
+fail() {
+  { echo "[${APP_NAME}] ERROR: $*" >>"${LOG_FILE}"; } 2>/dev/null || true
+  echo "[${APP_NAME}] ERROR: $*" >&2
+  exit 1
+}
+
+trace() {
+  { mkdir -p "${VAR_DIR}" && echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"${VAR_DIR}/lifecycle.log"; } 2>/dev/null || true
+}
+
+probe_ready() {
+  local url="http://127.0.0.1:$1/health/ready"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 5 "$url" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q -T 5 -O /dev/null "$url" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  return 1
+}
+
+image_id() { docker image inspect "$1" --format '{{.Id}}' 2>/dev/null || true; }
+container_image_id() { docker inspect -f '{{.Image}}' "${CONTAINER}" 2>/dev/null || true; }
+# 容器实际在用的镜像引用（不是我们声明的那一个——这两者可能不一致）
+container_image_ref() { docker inspect -f '{{.Config.Image}}' "${CONTAINER}" 2>/dev/null || true; }
+container_running() { [ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null)" = "true" ]; }
+
+compose_image() {
+  awk -F'image:' '/^[[:space:]]*image:/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "${COMPOSE_FILE}" 2>/dev/null
+}
+
+read_settings() {
+  if [ -r "${SETTINGS}" ]; then
+    # shellcheck disable=SC1090
+    . "${SETTINGS}"
+  fi
+}
+
+read_pending() {
+  TARGET_REF=""; FROM_VERSION=""; TO_VERSION=""; FROM_REF=""; ATTEMPTS=""; CREATED_TS=""; DEADLINE_MINUTES=""
+  if [ -r "${PENDING}" ]; then
+    # shellcheck disable=SC1090
+    . "${PENDING}"
+  fi
+}
+
+# 本版包声明的版本（TRIM_APPDEST 指向安装后的 target，升级时已被替换成新包）
+pkg_version() {
+  local m="${TRIM_APPDEST}/manifest"
+  [ -r "${m}" ] || return 0
+  awk -F= '/^[[:space:]]*version[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "${m}" 2>/dev/null
+}
+
+# 审计里的版本列不许出现 unknown：能拿到真值就用真值，拿不到就写 "-"
+seed_audit_versions() {
+  case "${TO_VERSION:-}" in
+    ""|unknown) TO_VERSION="$(pkg_version)"; [ -n "${TO_VERSION}" ] || TO_VERSION="${TRIM_APPVER:-}" ;;
+  esac
+  case "${FROM_VERSION:-}" in
+    ""|unknown) FROM_VERSION="-" ;;
+  esac
+  [ -n "${TO_VERSION:-}" ] || TO_VERSION="-"
+  [ -n "${FROM_VERSION:-}" ] || FROM_VERSION="-"
+}
+
+# 审计行：日期 | 旧版本 | 新版本 | 镜像引用 | image id | 触发来源
+# 连续重复（同 ref + 同 id）不重复写，避免 start 与 upgrade_callback 各写一条（第五轮 #5）
+write_history() { # $1=ref $2=id [$3=extra] [$4=trigger]
+  seed_audit_versions
+  local trigger="${4:-drift}"
+  if [ -r "${HISTORY_FILE}" ]; then
+    local last_ref last_id
+    last_ref="$(tail -n1 "${HISTORY_FILE}" 2>/dev/null | cut -f4)"
+    last_id="$(tail -n1 "${HISTORY_FILE}" 2>/dev/null | cut -f5)"
+    if [ "${last_ref}" = "$1" ] && [ "${last_id}" = "$2" ]; then
+      trace "history dedup: ${1} ${2}"
+      return 0
+    fi
+  fi
+  {
+    printf '%s\t%s\t%s\t%s\t%s\ttrigger=%s%s\n' \
+      "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${FROM_VERSION}" "${TO_VERSION}" \
+      "$1" "$2" "${trigger}" "${3:-}"
+  } >>"${HISTORY_FILE}" 2>/dev/null || true
+  chmod 600 "${HISTORY_FILE}" 2>/dev/null || true
+}
+
+arm_pending() { # $1=target_ref  $2=from_version  $3=to_version  [$4=from_ref]
+  local keep_created="${CREATED_TS:-}" attempts="${ATTEMPTS:-0}"
+  [ -n "${keep_created}" ] && [ "${TARGET_REF:-}" = "$1" ] || { keep_created="$(date '+%Y-%m-%dT%H:%M:%S%z')"; attempts=0; }
+  mkdir -p "${CFG_DIR}" 2>/dev/null || true
+  cat >"${PENDING}" <<EOF
+TARGET_REF=$1
+FROM_VERSION=${2:--}
+TO_VERSION=${3:--}
+FROM_REF=${4:-}
+CREATED_TS=${keep_created}
+ATTEMPTS=${attempts}
+DEADLINE_MINUTES=${DEADLINE_MINUTES:-${DEADLINE_MINUTES_DEFAULT}}
+EOF
+  chmod 600 "${PENDING}" 2>/dev/null || true
+}
+
+clear_pending() { rm -f "${PENDING}" 2>/dev/null || true; }
+
+# 回滚到 upgrade_init 记下的上一版镜像。main 里的回滚只用于「start 期间发现换了镜像但没换成功」这一种，
+# 其它情况（例如镜像根本不在本地）交给 pending 状态机，不在 start 里做破坏性动作。
+rollback_or_fail() {
+  local reason="$1" prev_ref prev_id got
+  prev_ref="$(head -n1 "${PREV_IMAGE_FILE}" 2>/dev/null | tr -d '[:space:]')"
+  prev_id="$(head -n1 "${PREV_IMAGE_ID_FILE}" 2>/dev/null | tr -d '[:space:]')"
+  if [ -z "${prev_ref}" ] || [ -z "$(image_id "${prev_ref}")" ]; then
+    fail "${reason}；未记录到可用的上一版镜像（${prev_ref:-<空>}），无法自动回滚。请人工处理：docker logs ${CONTAINER}"
+  fi
+  say "回滚到升级前镜像：${prev_ref}"
+  cp -f "${COMPOSE_FILE}" "${COMPOSE_FILE}.start-bak" 2>/dev/null || true
+  sed -i "s#^\([[:space:]]*image:[[:space:]]*\).*#\1${prev_ref}#" "${COMPOSE_FILE}" 2>/dev/null \
+    || fail "${reason}；改写 compose 回滚失败，请手动把 image 改回 ${prev_ref} 后 docker compose up -d --no-deps。"
+  compose up -d --no-deps --force-recreate --remove-orphans >>"${VAR_DIR}/lifecycle.log" 2>&1 \
+    || fail "${reason}；回滚重建容器失败，请人工介入（镜像 ${prev_ref}）。"
+  got="$(container_image_id)"
+  fail "${reason}。已回滚到 ${prev_ref}（当前 image id ${got:-unknown}${prev_id:+，升级前为 ${prev_id}}）。请查 ${VAR_DIR}/lifecycle.log 与 docker logs ${CONTAINER}。"
+}
+
+read_settings
+read_pending
+
+case "$1" in
+  start)
+    trace "main start pending=${TARGET_REF:-none}"
+    [ -f "${COMPOSE_FILE}" ] || fail "compose 文件缺失：${COMPOSE_FILE}"
+
+    declared_ref="$(compose_image)"
+    if [ -z "${declared_ref}" ]; then
+      warn "无法从 compose 解析 image，跳过漂移检查"
+      exit 0
+    fi
+
+    # 容器不存在（首次启动 / 刚卸载）：交给应用中心按 docker-project 创建，什么都不做
+    if [ -z "$(container_image_id)" ]; then
+      say "容器尚不存在，交由应用中心创建（${declared_ref}）"
+      exit 0
+    fi
+
+    actual_ref="$(container_image_ref)"
+    actual_id="$(container_image_id)"
+    declared_id="$(image_id "${declared_ref}")"
+
+    if [ "${declared_ref}" = "${actual_ref}" ] && [ "${actual_id}" = "${declared_id}" ]; then
+      # 一致：保持原来的空实现语义（不主动 up，避免与应用中心抢启停权）
+      if [ -n "${TARGET_REF:-}" ]; then
+        # 有陈旧标记但实际已一致：视为已校验完成
+        write_history "${actual_ref}" "${actual_id:--}"
+        clear_pending
+        say "镜像与 compose 声明一致（${actual_ref}），清理陈旧的待校验标记"
+        trace "main start consistent, pending cleared"
+      fi
+      exit 0
+    fi
+
+    # 漂移：compose 声明 ≠ 容器实际
+    say "检测到镜像漂移：compose 声明 ${declared_ref}，容器实际 ${actual_ref:-unknown}"
+    trace "main start drift declared=${declared_ref} actual=${actual_ref:-none}"
+
+    if [ -z "${declared_id}" ]; then
+      # 目标镜像不在本地：登记待校验，等 root 侧拉取。绝不 pull、绝不失败。
+      arm_pending "${declared_ref}" "${FROM_VERSION:-${TRIM_OLD_APPVER:--}}" "${TO_VERSION:-${TRIM_APPVER:-$(pkg_version)}}" "${actual_ref:-}"
+      say "目标镜像 ${declared_ref} 尚未落到本地：已登记「待校验升级」，由应用中心/管理员以 root 拉取后自动生效"
+      say "（包用户没有 fnOS 镜像站的签名头，不能自行拉取——平台设计，不是故障。）"
+      exit 0
+    fi
+
+    # 目标镜像已在本地：补一次重建，然后校验容器真的换成了它
+    say "目标镜像已在本地（image id ${declared_id}），补一次容器重建"
+    compose up -d --no-deps --force-recreate --remove-orphans >>"${VAR_DIR}/lifecycle.log" 2>&1 \
+      || warn "容器重建未成功（可交给应用中心或下一次启动重试），详见 ${VAR_DIR}/lifecycle.log"
+
+    new_id="$(container_image_id)"
+    if [ "${new_id}" != "${declared_id}" ]; then
+      rollback_or_fail "重建后容器镜像 id（${new_id:-unknown}）与 compose 声明的目标（${declared_id}）不一致"
+    fi
+
+    write_history "${declared_ref}" "${new_id}"
+    clear_pending
+    say "镜像已切换到 ${declared_ref}（image id ${new_id}）"
+    exit 0
+    ;;
+
+  stop)
+    trace "main stop"
+    exit 0
+    ;;
+
+  status)
+    # 三态：0 运行中（含"已就绪但待校验"）/ 1 故障 / 3 未运行
+    container_running || exit 3
+
+    declared_ref="$(compose_image)"
+    actual_ref="$(container_image_ref)"
+    declared_id=""
+    [ -n "${declared_ref}" ] && declared_id="$(image_id "${declared_ref}")"
+    actual_id="$(container_image_id)"
+
+    # 独立性兜底：即使 upgrade_callback 从未被调用（没有 pending 标记），
+    # 只要发现「compose 声明 ≠ 容器实际」，也要把待校验状态登记下来，不能让漂移静默存在。
+    if [ -z "${TARGET_REF:-}" ] && [ -n "${declared_ref}" ] && [ "${declared_ref}" != "${actual_ref}" ]; then
+      arm_pending "${declared_ref}" "${TRIM_OLD_APPVER:--}" "${TRIM_APPVER:-$(pkg_version)}" "${actual_ref:-}"
+      read_pending
+      say "检测到镜像漂移（compose ${declared_ref} ≠ 容器 ${actual_ref:-unknown}），已登记待校验状态"
+    fi
+
+    if [ -n "${TARGET_REF:-}" ]; then
+      target_id="$(image_id "${TARGET_REF}")"
+      if [ -n "${target_id}" ] && [ -n "${actual_id}" ] && [ "${actual_id}" = "${target_id}" ]; then
+        write_history "${TARGET_REF}" "${target_id}"
+        clear_pending
+        say "镜像升级已校验通过：${TARGET_REF}（image id ${target_id}）"
+        probe_ready "${API_PORT:-9200}" && exit 0 || exit 1
+      fi
+
+      # 逃生门：只放宽「容器镜像 id == 目标镜像 id」这一条校验。
+      # 不给包用户任何拉取能力，也不把"版本号变了镜像没换"变成合规——只是记为「未校验」。
+      if [ -f "${CFG_DIR}/allow_unverified_image" ]; then
+        warn "存在 ${CFG_DIR}/allow_unverified_image：跳过镜像 id 一致性校验（目标 ${TARGET_REF} / 容器 ${actual_id:-unknown}），按「未校验」记录"
+        write_history "${TARGET_REF}" "${actual_id:--}" $'\tunverified=1'
+        clear_pending
+        probe_ready "${API_PORT:-9200}" && exit 0 || exit 1
+      fi
+
+      # 到期判定：按 CREATED_TS 起的墙钟分钟数（缺失时才退回次数）
+      deadline_min="${DEADLINE_MINUTES:-${DEADLINE_MINUTES_DEFAULT}}"
+      now_epoch="$(date +%s)"
+      created_epoch="$(date -d "${CREATED_TS:-}" +%s 2>/dev/null || echo 0)"
+      expired=0
+      if [ "${created_epoch}" -gt 0 ] 2>/dev/null; then
+        elapsed_min=$(( (now_epoch - created_epoch) / 60 ))
+        [ "${elapsed_min}" -ge "${deadline_min}" ] && expired=1
+        window_desc="已等 ${elapsed_min} 分钟 / 宽限 ${deadline_min} 分钟"
+      else
+        attempts=$(( ${ATTEMPTS:-0} + 1 ))
+        [ "${attempts}" -ge "${DEADLINE_ATTEMPTS:-20}" ] && expired=1
+        window_desc="已校验 ${attempts} 次 / 宽限 ${DEADLINE_ATTEMPTS:-20} 次"
+      fi
+
+      if [ "${expired}" = "1" ]; then
+        attempts=$(( ${ATTEMPTS:-0} + 1 ))
+
+        # 回滚目标引用的三级兜底：previous_image → 容器当前实际在用 → pending 里的 FROM_REF。
+        # 漂移是 start/status 发现的（没跑过 upgrade_init），所以前两者可能都不存在——
+        # 这时绝不能留空，宁可给一段能照着做的文字指引。
+        rollback_ref=""
+        rollback_src=""
+        if [ -s "${PREV_IMAGE_FILE}" ]; then
+          rollback_ref="$(head -n1 "${PREV_IMAGE_FILE}" 2>/dev/null | tr -d '[:space:]')"
+          [ -n "${rollback_ref}" ] && rollback_src="previous_image"
+        fi
+        if [ -z "${rollback_ref}" ] && [ -n "${actual_ref:-}" ]; then
+          rollback_ref="${actual_ref}"
+          rollback_src="容器当前实际运行"
+        fi
+        if [ -z "${rollback_ref}" ] && [ -n "${FROM_REF:-}" ]; then
+          rollback_ref="${FROM_REF}"
+          rollback_src="pending 记录"
+        fi
+
+        {
+          echo "[${APP_NAME}] 升级未生效：compose 声明 ${TARGET_REF}，但运行中容器仍是 ${actual_ref:-unknown}。"
+          echo "  目标镜像 id：${target_id:-<未获取到，可能尚未拉取成功>}"
+          echo "  容器镜像 id：${actual_id:-<未获取到>}"
+          echo "  ${window_desc} 仍未匹配。常见原因：升级时没有执行 compose up（未拉取新镜像），或拉取失败。"
+          echo "  修复（按顺序试）：① sudo docker images 看有没有目标 tag；② 没有就由管理员执行 sudo docker pull ${TARGET_REF}；③ 再在应用中心停止→启动（start 会自动重建并校验）。"
+          if [ -n "${rollback_ref}" ]; then
+            echo "  回滚：由管理员把 ${COMPOSE_FILE} 的 image 行改回 ${rollback_ref}（来源：${rollback_src}）后执行 docker compose up -d --no-deps。"
+            [ "${rollback_src}" != "previous_image" ] && echo "        注：本应用没有记录上一版镜像——这次是启动/状态检查时发现漂移，而不是升级流程触发，所以用的是「${rollback_src}」这一值。"
+          else
+            echo "  回滚：本应用没有记录上一版镜像（这次是启动/状态检查时发现漂移，而不是升级流程触发）。请执行 sudo docker images 找出仍在本地、且与应用先前版本号对应的 tag，把 ${COMPOSE_FILE} 的 image 行改回该 tag 后执行 docker compose up -d --no-deps。"
+          fi
+        } >>"${LOG_FILE}" 2>/dev/null || true
+        arm_pending "${TARGET_REF}" "${FROM_VERSION:--}" "${TO_VERSION:-$(pkg_version)}" "${FROM_REF:-${actual_ref:-}}"
+        sed -i "s#^ATTEMPTS=.*#ATTEMPTS=${attempts}#" "${PENDING}" 2>/dev/null || true
+        say "升级校验失败：容器仍是旧镜像（${window_desc}）"
+        exit 1
+      fi
+
+      arm_pending "${TARGET_REF}" "${FROM_VERSION:--}" "${TO_VERSION:-$(pkg_version)}" "${FROM_REF:-${actual_ref:-}}"
+      sed -i "s#^ATTEMPTS=.*#ATTEMPTS=$(( ${ATTEMPTS:-0} + 1 ))#" "${PENDING}" 2>/dev/null || true
+      { echo "[$(date '+%Y-%m-%d %H:%M:%S')] pending verify ${window_desc} target=${TARGET_REF} container=${actual_id:-none}"; } >>"${VAR_DIR}/upgrade-verify.log" 2>/dev/null || true
+      probe_ready "${API_PORT:-9200}" && exit 0 || exit 1
+    fi
+
+    probe_ready "${API_PORT:-9200}" && exit 0 || exit 1
+    ;;
+
+  *)
+    fail "未知子命令：$1（支持 start|stop|status）"
+    ;;
+esac
