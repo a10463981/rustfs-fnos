@@ -61,6 +61,54 @@ Packing successfully. The output file rustfs-fnos.fpk can be found in the workin
 bash scripts/preflight.sh deploy/fnos        # 期望 FAIL=0 WARN=0
 ```
 
+## ⚠️ 打包前必做：确认 git 真的记住了可执行位（`core.filemode=false` 陷阱）
+
+**现象**：`preflight.sh` 报
+
+```
+== 5b 权限（install-local 与包用户执行） ==
+  FAIL  以下生命周期脚本缺少 others 可执行位：
+          ./cmd/install_init  ./cmd/install_callback  ./cmd/main  …
+```
+
+但你本地 `ls -l deploy/fnos/cmd/` 明明是 `-rwxr-xr-x`（`755`），怎么改都不消失。
+
+**原因**：有些文件系统 / 工作区里 git 的 `core.filemode` 是 `false` —— **`chmod` 根本不会被 git 记录**，进仓库的 blob 就是 `100644`。
+于是「本地 755、仓库 644、从仓库克隆出来不可执行」三者不一致：
+
+- 本地跑 preflight 全绿（工作区文件确实是 755）；
+- CI / 别人 clone 出来跑 → 9 个 `cmd/*` 全部不可执行 → `FAIL`；
+- 如果没被 CI 拦住，发出去的包里脚本不可执行，用户装完直接跑不起来。
+
+**修法（两条都要做）**：
+
+```bash
+# ① 让这个仓库开始跟踪权限位（只需一次，写进 .git/config）
+git config core.filemode true
+
+# ② 把已经以 100644 入库的文件，在索引里改成可执行
+git update-index --chmod=+x deploy/fnos/cmd/* scripts/*
+
+# ③ 核对：每一行都应以 100755 开头
+git ls-files -s deploy/fnos/cmd scripts | awk '{print $1, $4}'
+```
+
+> 只做 ① 不够：① 只影响**之后的** `chmod`，已经入库的 `100644` 仍要 ② 改索引。
+> 换句话说 `git add --chmod=+x …` 或 `update-index --chmod=+x …` 这一步不能省。
+
+**别用「本地 preflight 绿了」证明没问题。** 权限这类问题必须在**干净克隆**里验一次：
+
+```bash
+tmp="$(mktemp -d)"
+git clone --depth 1 . "$tmp/repo"        # 或从远端 clone
+bash "$tmp/repo/scripts/preflight.sh" "$tmp/repo/deploy/fnos" | tail -5
+rm -rf "$tmp"
+```
+
+期望看到 §5b 三条 `OK`。这条检查对 CI 是自动的（`fpk-ci.yml` 每次都从仓库检出），但**在你自己机器上 push 之前值得手动跑一遍**——它是唯一能发现「本地绿、仓库红」的手段。
+
+---
+
 ## 发布前必过的第二道闸：`scripts/check-image-bump.sh`
 
 ### 它防的是什么

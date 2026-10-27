@@ -210,6 +210,7 @@ if [ "${owner_uid}" != "${TRIM_UID}" ] && [ "${owner_uid}" != "${run_uid}" ]; th
 | v10 三态 | 设置页能否回默认 | **改不回去**（`wizard_data_dir` 为空 = 「不修改」）；且重复保存会**白重建一次容器** | 加 `wizard_data_mode` 三态；`config_callback` 实现「恢复默认位置」；无变化跳过 `--force-recreate` |
 | v11 收尾 | 切回默认后数据看着不见了 | 恢复默认后读 `def-check` = **404**，数据在 `data.old-20261027193301/`（21,379 B）但**无任何提示**；卸载移除镜像 tag | 回到默认时打印 `data.old-*` 路径/体积/条目 + 搬回命令；卸载时打印镜像 tag 提示；顺带拒绝「在设置页改数据子目录名」 |
 | v12 图标 | 真实 logo | 源图是 256×256 的**横排 wordmark**（内容框 227×43）；缩到 64px 后内容仅 **56×10**，不可辨 | 4 个图标都生成 + 补 `sRGB` chunk + 尺寸断言；64px 观感问题挂起（见 §五） |
+| **CI 首跑**（不是真机抓到的，是 GitHub Actions 抓到的） | 仓库首次 push 触发 `fpk-ci` | 第 6 步「结构预检」红：`§5b` 报 9 个 `cmd/*` **缺少 others 可执行位**，而**本地跑 preflight 是全绿的**。根因：本工作区 git 的 **`core.filemode=false`**，`chmod 755` 不被记录，入库是 `100644`；CI 从仓库克隆，自然不可执行。这类问题**只有在「从仓库克隆」时才暴露**，本地怎么试都发现不了 | `git config core.filemode true` + `git update-index --chmod=+x`（13 个文件），核对 `git ls-files -s` 全为 `100755`。现在 `docs/build.md` 有专门一节讲这个陷阱 + 「干净克隆验证」命令 |
 
 ---
 
