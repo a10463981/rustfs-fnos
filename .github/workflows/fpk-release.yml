@@ -44,10 +44,10 @@ jobs:
             exit 1
           fi
           VERSION="${TAG#v}"
-          case "${VERSION}" in
-            *-*) echo "PRERELEASE=true"  >> "${GITHUB_ENV}" ;;
-            *)   echo "PRERELEASE=false" >> "${GITHUB_ENV}" ;;
-          esac
+          # v1.0.4-1 起：本项目的 `-N` 是**同一上游镜像的打包修订号**，不是上游预览版，
+          # 因此 vX.Y.Z 与 vX.Y.Z-N 一律按**正式版**发布（prerelease=false、latest=true）。
+          # 上游那种 1.0.4-preview.1 的语义与本项目无关，不要混用。
+          echo "PRERELEASE=false" >> "${GITHUB_ENV}"
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
           echo "FPK_ASSET=${APPNAME}-${VERSION}-${PLATFORM}.fpk" >> "${GITHUB_ENV}"
 
