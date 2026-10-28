@@ -353,15 +353,28 @@ elif [ "${req_action}" = "custom" ]; then
     new_owner_uid="$(stat -c '%u' "${new_dir}" 2>/dev/null || echo '')"
     if ! probe_writable "${new_dir}"; then
       fail "新数据目录不可写：${new_dir}
-  成因A：目录已存在，但以本应用身份（UID ${data_uid}、组 ${data_gid}）写不进去。
-  该目录属主 ${new_owner_name}，权限 ${new_owner_mode}。
+  当前身份：UID ${data_uid}、组 ${data_gid}；该目录属主 ${new_owner_name}，权限 ${new_owner_mode}。
 
-  【可以直接粘，执行后重新保存设置】
-    sudo chown -R ${data_uid}:${data_gid} ${new_dir}
-    sudo chmod 750 ${new_dir}
+【为什么会这样】
+  fnOS 用 TrimACL 给**具体的应用用户**单独授权，而这个用户是随应用安装才创建的。
+  如果这个目录是你在「文件管理」里**先**建好的（或者应用刚重装过、用户被重建），
+  建目录时本应用用户还不存在，目录就没带上给它的授权 —— 现在以 ${data_uid} 身份写不进去。
 
-  或者换一个目录。注意：本次没有改动任何数据。
-"
+【三条路，按省事程度排序，任选一条】
+
+  1) 最省事：换一个本应用能写的目录 —— 例如先在设置里「恢复默认位置」，
+     等应用正常跑起来，再把数据迁到 ${new_dir}（那时授权已生成）。
+
+  2) 如果确认父目录对本应用可写，可把这个**空目录**删掉，让应用自己创建：
+       sudo rmdir ${new_dir}
+     注意：在 /vol1/1000 这类「用户空间根」下通常**不行** ——
+     fnOS 只对它下面被单独授权的子目录放行（实测）。
+
+  3) 最确定：直接把这个目录交给本应用（改属主）：
+       sudo chown -R ${data_uid}:${data_gid} ${new_dir}
+       sudo chmod 750 ${new_dir}
+
+改完回到这里重新保存设置即可。本次设置没有改动你的任何数据。"
     fi
     if [ -n "${new_owner_uid}" ] && [ "${new_owner_uid}" != "${data_uid}" ]; then
       say "提示：${new_dir} 的属主是 ${new_owner_name}，不是本应用用户（UID ${data_uid}），但实际可写（fnOS 的 TrimACL 已授权）。继续。"

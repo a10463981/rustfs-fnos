@@ -9,6 +9,10 @@
 #   scripts/check-image-bump.sh <当前 fpk 项目目录> --baseline <上一版项目目录 | 上一版 compose 文件>
 #   scripts/check-image-bump.sh <当前 fpk 项目目录> --baseline-git <git ref> [--project-prefix deploy/fnos]
 #   scripts/check-image-bump.sh <当前 fpk 项目目录> --allow-no-baseline      # 无基线时只 WARN
+#   scripts/check-image-bump.sh <当前 fpk 项目目录> --allow-same-image [<CHANGELOG 路径>]
+#       允许「包版本涨了、镜像没换」的**纯打包修订**发布，但必须满足：
+#         CHANGELOG 里本次版本下有一行 `packaging-only: <一句话说明>`。
+#       这是「改闸」而不是「骗闸」：把例外显式化、可审计、且不改变镜像。
 #
 # 退出码：0 通过（可能带 WARN）｜1 断言失败｜2 用法错误
 #
@@ -21,6 +25,8 @@ BASELINE=""
 BASELINE_GIT=""
 PREFIX="deploy/fnos"
 ALLOW_NO_BASELINE=0
+ALLOW_SAME_IMAGE=0
+CHANGELOG_FILE=""
 
 die_usage() { echo "用法错误：$*" >&2; exit 2; }
 
@@ -29,6 +35,10 @@ while [ $# -gt 0 ]; do
     --baseline)        BASELINE="${2:-}"; shift 2 ;;
     --baseline-git)    BASELINE_GIT="${2:-}"; shift 2 ;;
     --project-prefix)  PREFIX="${2:-}"; shift 2 ;;
+    --allow-same-image)
+      ALLOW_SAME_IMAGE=1; shift
+      # 可选紧跟一个 CHANGELOG 路径；不跟则自动找仓库根的 CHANGELOG.md
+      case "${1:-}" in ''|--*) : ;; *) CHANGELOG_FILE="$1"; shift ;; esac ;;
     --allow-no-baseline) ALLOW_NO_BASELINE=1; shift ;;
     -h|--help)         sed -n '2,20p' "$0"; exit 0 ;;
     -*)                die_usage "未知选项 $1" ;;
@@ -129,7 +139,34 @@ else
     [ "${CUR_IMAGE}"   != "${BASE_IMAGE}" ]   && ICHANGED=1
 
     if [ "${VCHANGED}" = "1" ] && [ "${ICHANGED}" = "0" ]; then
-      bad "版本号涨了（${BASE_VERSION} → ${CUR_VERSION}）但 image 没变（仍是 ${CUR_IMAGE}）：用户会以为升级成功，实际跑的是同一个镜像。请换一个新的 tag（或 digest）。"
+      # ---- 纯打包修订的显式例外（v1.0.5 起）----
+      # 为什么需要它：有些版本只改了脚本/向导/文档（例如修一个安装期误判），
+      # 镜像一个字节都不用动；但「版本涨了镜像没换」本身确实是危险信号，不能一律放行。
+      # 所以要求：① 显式传 --allow-same-image ② CHANGELOG 里本次版本下有 `packaging-only:` 行。
+      # 两条缺一，仍然 FAIL —— 「版本涨了镜像没换」这个错误不会因此重新溜过去。
+      PKG_ONLY_LINE=""
+      if [ "${ALLOW_SAME_IMAGE}" = "1" ]; then
+        CL="${CHANGELOG_FILE}"
+        [ -n "${CL}" ] || CL="$(dirname "${CUR}")/../CHANGELOG.md"
+        [ -f "${CL}" ] || CL="$(pwd)/CHANGELOG.md"
+        if [ -f "${CL}" ]; then
+          # 只认「本次版本」段落里、以 packaging-only: 开头的一行（大小写不敏感）
+          PKG_ONLY_LINE="$(awk -v ver="${CUR_VERSION}" '
+            $0 ~ "^#+[[:space:]]*.*"ver {inblk=1; next}
+            inblk && $0 ~ "^#+[[:space:]]*[0-9]" {inblk=0}
+            inblk && tolower($0) ~ /^[[:space:]]*packaging-only:/ {print; exit}
+          ' "${CL}" 2>/dev/null)"
+        fi
+      fi
+      if [ "${ALLOW_SAME_IMAGE}" = "1" ] && [ -n "${PKG_ONLY_LINE}" ]; then
+        warn "纯打包修订（镜像未变）已按例外放行：${PKG_ONLY_LINE#*: }"
+        warn "  依据：--allow-same-image + CHANGELOG 中 ${CUR_VERSION} 段的 packaging-only 标记（${CL}）"
+        warn "  发布说明里必须写明「本次不含镜像变更」，否则用户会以为服务本体也升级了。"
+      elif [ "${ALLOW_SAME_IMAGE}" = "1" ]; then
+        bad "传了 --allow-same-image，但在 CHANGELOG 里找不到 ${CUR_VERSION} 段的 \`packaging-only:\` 说明（找的是 ${CL:-未找到文件}）。纯打包修订必须留下这行标记，否则无法审计。"
+      else
+        bad "版本号涨了（${BASE_VERSION} → ${CUR_VERSION}）但 image 没变（仍是 ${CUR_IMAGE}）：用户会以为升级成功，实际跑的是同一个镜像。请换一个新的 tag（或 digest）。纯打包修订请显式加 --allow-same-image 并在 CHANGELOG 写 packaging-only: 说明。"
+      fi
     elif [ "${VCHANGED}" = "0" ] && [ "${ICHANGED}" = "1" ]; then
       bad "image 变了（${BASE_IMAGE} → ${CUR_IMAGE}）但 manifest.version 没变（仍是 ${CUR_VERSION}）：应用中心不会认为有更新。请同步升 version。"
     elif [ "${VCHANGED}" = "1" ] && [ "${ICHANGED}" = "1" ]; then

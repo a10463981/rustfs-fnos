@@ -318,21 +318,88 @@ check_data_dir() { # $1=规范化后的路径  $2=允许前缀（空格分隔：
   grp="$(id -gn 2>/dev/null || echo "GID $(id -g)")"
   trace "data-dir check d=${d} probe=${probe} cur_uid=$(id -u) cur_user=${me} target_uid=${uid} target_gid=${gid}"
 
-  if ! probe_writable "${probe}"; then
+  # ---- L5a 平台代建豁免（v1.0.5）----
+  # 真机事故（.212 首次安装 + 默认位置）：目标 /vol1/@appdata/<app>/data 尚不存在，
+  # 最近已存在祖先是 /vol1/@appdata（root:root 755）→ 包用户不能在平台根里 mkdir →
+  # 被判「成因B」→ install error 10237 + rollback。
+  # 但那台机上其它应用目录的属主都是各自的包用户，说明 @appdata/<app> 是**平台在安装过程中**
+  # 创建并 chown 的 —— 我们在平台建目录之前就要求父目录可写，太早了。
+  #
+  # 三条件**同时**满足才豁免，缺一不可：
+  #   ① 目标在**本项目自己的**应用目录之下（allow 前缀）；
+  #   ② 目标本身不存在；
+  #   ③ 最近已存在的祖先**恰好是平台根**（/vol*/@appdata 等，不能更深也不能更浅）。
+  # 其余情况一律照旧真实写探测 —— root:root 700/755 这类真不可写仍然拦得住；
+  # 目录建好后 install_callback 会再真实写一次（二次保险）。
+  defer_probe=0
+  if [ ! -e "${d}" ]; then
+    under_own=0
+    for a in ${allow}; do
+      [ -n "${a}" ] || continue
+      case "${d}/" in "${a}/"*) under_own=1 ;; esac
+    done
+    if [ "${under_own}" = "1" ]; then
+      case "${probe}" in
+        /vol*/@appdata|/vol*/@appconf|/vol*/@apptemp|/vol*/@apphome)
+          defer_probe=1
+          say "数据目录 ${d} 尚不存在，将由应用中心在安装过程中创建；可写性会在目录建好后自动复验。"
+          trace "data-dir defer d=${d} probe=${probe}（平台代建豁免：在自己应用目录下 + 不存在 + 祖先为平台根）" ;;
+      esac
+    fi
+  fi
+
+  if [ "${defer_probe}" != "1" ] && ! probe_writable "${probe}"; then
     owner="$(owner_desc "${probe}")"
     mode="$(stat -c '%a' "${probe}" 2>/dev/null || echo 未知)"
     if [ -d "${d}" ]; then
       fail "数据目录不可写：${d}
-  成因A：目录已存在，但以本应用身份（UID ${uid}、组 ${gid}）写不进去。
-  该目录属主 ${owner}，权限 ${mode}。
+  当前身份：UID ${uid}、组 ${gid}；该目录属主 ${owner}，权限 ${mode}。
 
-  【可以直接粘，执行后回应用中心重新安装】
-    sudo chown -R ${uid}:${gid} ${d}
-    sudo chmod 750 ${d}
-"
+【为什么会这样（首次安装最常见）】
+  fnOS 不是用传统的「属主/组/其他」判断权限，而是用 TrimACL 给**具体的应用用户**单独授权
+  （一条 allow uid:${uid} …）。本应用的用户是在**安装过程中**才被创建的：
+  如果你**先**在「文件管理」里建好这个目录、**后**装应用，那时候本应用的用户还不存在，
+  这个目录因此没被授权 —— 安装时它以 ${uid} 身份去写，就写不进去。
+
+【三条路，按省事程度排序，任选一条】
+
+  1) 最省事：向导里「数据存放位置」保持「不修改」（用默认位置）先把应用装上；
+     装完再到「应用中心 → 本应用 → 设置」里把数据目录改成 ${d} —— 那时用户已存在，平台会补授权。
+
+  2) 如果你确认父目录对本应用可写，可把这个**空目录**删掉，让应用自己创建：
+       sudo rmdir ${d}
+     注意：在 /vol1/1000 这类「用户空间根」下通常**不行** —— fnOS 只对它下面被单独授权的子目录放行（实测）。
+
+  3) 最确定：直接把这个目录交给本应用（改属主）：
+       sudo chown -R ${uid}:${gid} ${d}
+       sudo chmod 750 ${d}
+
+改完回应用中心重新安装即可。本次安装没有改动你的任何数据。
+
+  如果这是**首次安装**、而且你用的是**默认数据位置**（/vol<N>/@appdata/…），
+  上面三条路都不该走到 —— 那种情况由平台代建目录。请把这行日志贴给维护者。"
+
     else
-      fail "数据目录不可写：${d}
-  成因B：这个路径还不存在，且父目录 ${probe} 不允许本应用写入（属主 ${owner}，权限 ${mode}）。
+      case "${probe}" in
+        /vol*/@appdata|/vol*/@appconf|/vol*/@apptemp|/vol*/@apphome)
+          # 走到这里说明 L5a 豁免没生效（例如老版本包），这是**我们的问题**，不是用户的
+          fail "数据目录不可写：${d}
+  这个路径还没建成，而它的父目录 ${probe} 是**平台目录**（属主 ${owner}，权限 ${mode}）。
+  正常情况下，这类目录由应用中心在安装过程中创建、并交给本应用，不需要你处理。
+
+  【请这样做】
+    1) 如果你装的是旧版本（v1.0.5 之前），升级到 v1.0.5 或更新版本再装一次 —— 这是已知缺陷；
+    2) 临时绕开：向导里「数据存放位置」改填存储空间里的普通目录（例如 /vol1/rustfs-data）
+       或先按默认位置装完；
+    3) 仍然不行，把这几行日志反馈给维护者。
+
+  【请不要这样做】
+    不要 chown / chmod ${probe} —— 那是平台目录，改动会波及其它应用。
+"
+          ;;
+        *)
+          fail "数据目录不可写：${d}
+  这个路径还不存在，且父目录 ${probe} 不允许本应用写入（属主 ${owner}，权限 ${mode}）。
 
   【可以直接粘】
     sudo mkdir -p ${d}
@@ -341,12 +408,14 @@ check_data_dir() { # $1=规范化后的路径  $2=允许前缀（空格分隔：
 
   或者改用存储空间里的其它目录（例如 /vol1/rustfs-data）后重新安装。
 "
+          ;;
+      esac
     fi
   fi
 
   # 可写但属主不是我们 —— 这在 fnOS 上是正常的（TrimACL 授权），说明一句，避免以后误判
   owner_uid="$(stat -c '%u' "${probe}" 2>/dev/null || echo '')"
-  if [ -n "${owner_uid}" ] && [ "${owner_uid}" != "${uid}" ]; then
+  if [ "${defer_probe}" != "1" ] && [ -n "${owner_uid}" ] && [ "${owner_uid}" != "${uid}" ]; then
     say "提示：${probe} 的属主是 $(owner_desc "${probe}")，不是本应用用户（UID ${uid}），但实际可写（fnOS 的 TrimACL 已授权）。继续。"
   fi
 
@@ -457,7 +526,13 @@ case "${data_subdir}" in
   ''|*[!a-z0-9_-]*) fail "数据子目录名非法：${data_subdir}（只允许小写字母、数字、下划线、连字符）" ;;
 esac
 default_data_dir="${VAR_DIR}/${data_subdir}"
-req="$(resolve_data_request "${wizard_data_mode:-keep}" "${wizard_data_dir:-}")"
+# v1.0.4-1 起：安装期固定使用默认位置，向导里不再提供数据目录选择。
+# 若仍收到 wizard_data_dir（旧客户端 / 手工 --env / 复用旧配置），**忽略并提示**，不当作错误。
+if [ -n "${wizard_data_dir:-}" ]; then
+  warn "向导里传了数据目录「${wizard_data_dir}」，本版本安装期固定用默认位置 —— 已忽略该值。
+  装好后可在「应用中心 → 本应用 → 设置」里改：先到「访问权限」授权该目录，再到「运行设置」改路径。"
+fi
+req="keep|"
 req_action="${req%%|*}"
 req_path="${req#*|}"
 if [ "${req_action}" = "error" ]; then

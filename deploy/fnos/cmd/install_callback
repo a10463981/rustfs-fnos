@@ -311,7 +311,13 @@ chmod 700 "${CRED_DIR}" 2>/dev/null || true
 
 link_path="${VAR_DIR}/${data_subdir}"
 # 归一「本次要做的事」：keep / custom / default（规则见 resolve_data_request）
-req="$(resolve_data_request "${wizard_data_mode:-keep}" "${wizard_data_dir:-}")"
+# v1.0.4-1 起：安装期固定使用默认位置，向导里不再提供数据目录选择。
+# 若仍收到 wizard_data_dir（旧客户端 / 手工 --env / 复用旧配置），**忽略并提示**，不当作错误。
+if [ -n "${wizard_data_dir:-}" ]; then
+  warn "向导里传了数据目录「${wizard_data_dir}」，本版本安装期固定用默认位置 —— 已忽略该值。
+  装好后可在「应用中心 → 本应用 → 设置」里改：先到「访问权限」授权该目录，再到「运行设置」改路径。"
+fi
+req="keep|"
 req_action="${req%%|*}"
 req_path="${req#*|}"
 case "${req_action}" in
@@ -341,9 +347,29 @@ if [ -z "${data_dir}" ]; then
     rm -f "${link_path}" || fail "无法移除旧的数据目录链接：${link_path}"
     say "数据目录已改回默认位置（原指向 ${previous_dir:-未知}，该目录与其数据均未删除）。"
   fi
-  mkdir -p "${link_path}" || fail "创建数据目录失败：${link_path}"
+  mkdir -p "${link_path}" || fail "创建数据目录失败：${link_path}
+  这个路径属于应用自己的数据目录（默认位置）。正常情况下它由应用中心创建并交给本应用；
+  如果这里失败，多半是平台目录还没建好。请把这段日志反馈给维护者，不要手工 chown 上级平台目录。"
   data_dir="${link_path}"
   say "数据目录：${data_dir}（默认位置，位于应用数据目录内）"
+
+  # 【二次保险 v1.0.5】目录已创建，这里再以容器运行用户身份**真实写一次**。
+  # 为什么必须有这一步：install_init 在「平台代建」情形下会跳过安装前的写探测
+  # （那时 @appdata/<app> 还不存在，父目录是 root:root 755，判「不可写」是误判）；
+  # 所以真正的守门人在这里 —— 真不可写照样拦住，且原因会写进 TRIM_TEMP_LOGFILE。
+  if ! probe_writable "${data_dir}"; then
+    fail "数据目录仍然不可写：${data_dir}
+  目录已创建，但以本应用身份（UID ${TRIM_UID:-未知}、组 ${TRIM_GID:-未知}）写不进去；
+  该目录属主 $(owner_desc "${data_dir}")，权限 $(stat -c '%a' "${data_dir}" 2>/dev/null || echo 未知)。
+
+【请这样做】
+  把这段日志反馈给维护者 —— 默认位置本应由应用中心创建并交给本应用，不该出现这个错误。
+  临时绕开：向导里「数据存放位置」改填存储空间里的普通目录（例如 /vol1/rustfs-data）。
+
+【请不要这样做】
+  不要 chown / chmod 上级的平台目录（例如 /vol1/@appdata）—— 那会波及其它应用。
+"
+  fi
 else
   if ! mkdir -p "${data_dir}" 2>/dev/null; then
     uid_now="$(id -u 2>/dev/null || echo '')"
@@ -351,8 +377,25 @@ else
     data_gid="${TRIM_GID:-$(id -g 2>/dev/null || echo "${uid_now}")}"
     probe="${data_dir}"
     while [ ! -e "${probe}" ] && [ "${probe}" != "/" ]; do probe="$(dirname "${probe}")"; done
-    fail "数据目录不可写：${data_dir}
-  成因B：这个路径建不出来——父目录 ${probe} 不允许本应用写入（属主 $(owner_desc "${probe}")，权限 $(stat -c '%a' "${probe}" 2>/dev/null || echo 未知)）。
+    case "${probe}" in
+      /vol*/@appdata|/vol*/@appconf|/vol*/@apptemp|/vol*/@apphome)
+        fail "数据目录不可写：${data_dir}
+  这个路径建不出来，而它的父目录 ${probe} 是**平台目录**
+  （属主 $(owner_desc "${probe}")，权限 $(stat -c '%a' "${probe}" 2>/dev/null || echo 未知)）。
+  正常情况下平台目录由应用中心创建，不该由安装脚本去建 —— 这属于已知缺陷。
+
+  【请这样做】
+    1) 向导里「数据存放位置」改填存储空间里的普通目录（例如 /vol1/rustfs-data）后重装；
+    2) 或升级到最新版本再试；
+    3) 仍不行就把这段日志反馈给维护者。
+
+  【请不要这样做】
+    不要 chown / chmod ${probe} —— 那是平台目录，改动会波及其它应用。
+" ;;
+      *)
+        fail "数据目录不可写：${data_dir}
+  这个路径建不出来 —— 父目录 ${probe} 不允许本应用写入
+  （属主 $(owner_desc "${probe}")，权限 $(stat -c '%a' "${probe}" 2>/dev/null || echo 未知)）。
 
   【可以直接粘，执行后再安装一次】
     sudo mkdir -p ${data_dir}
@@ -360,7 +403,8 @@ else
     sudo chmod 750 ${data_dir}
 
   或者改用存储空间里的其它目录（例如 /vol1/rustfs-data）后重装。
-"
+" ;;
+    esac
   fi
   if [ -L "${link_path}" ]; then
     cur="$(readlink "${link_path}" 2>/dev/null || true)"
@@ -408,13 +452,30 @@ owner_mode="$(stat -c '%a' "${data_dir}" 2>/dev/null || echo 未知)"
 if ! probe_writable "${data_dir}"; then
   if [ -d "${data_dir}" ]; then
     fail "数据目录不可写：${data_dir}
-  成因A：目录已存在，但以本应用身份（UID ${data_uid}、组 ${data_gid}）写不进去。
-  该目录属主 ${owner_name}，权限 ${owner_mode}。
+  当前身份：UID ${data_uid}、组 ${data_gid}；该目录属主 ${owner_name}，权限 ${owner_mode}。
 
-  【可以直接粘，执行后再安装一次】
-    sudo chown -R ${data_uid}:${data_gid} ${data_dir}
-    sudo chmod 750 ${data_dir}
-"
+【为什么会这样（首次安装最常见）】
+  fnOS 用 TrimACL 给**具体的应用用户**单独授权（一条 allow uid:${data_uid} …），
+  而这个用户是**安装过程中**才被创建的。如果你的目录是**先**在「文件管理」里建好、
+  **后**装应用，建目录时本应用用户还不存在，这个目录就没被授权 ——
+  安装时它以 ${data_uid} 身份去写，自然写不进去。
+
+【三条路，按省事程度排序，任选一条】
+
+  1) 最省事：向导里「数据存放位置」保持「不修改」（用默认位置）先把应用装上；
+     装完再到「应用中心 → 本应用 → 设置」把数据目录改成 ${data_dir} ——
+     那时用户已存在，平台会补授权。
+
+  2) 如果确认父目录对本应用可写，可把这个**空目录**删掉，让应用自己创建：
+       sudo rmdir ${data_dir}
+     注意：在 /vol1/1000 这类「用户空间根」下通常**不行** ——
+     fnOS 只对它下面被单独授权的子目录放行（实测）。
+
+  3) 最确定：直接把这个目录交给本应用（改属主）：
+       sudo chown -R ${data_uid}:${data_gid} ${data_dir}
+       sudo chmod 750 ${data_dir}
+
+改完回应用中心重新安装即可。本次安装没有改动你的任何数据。"
   else
     fail "数据目录不可写：${data_dir}
   成因B：这个路径还没建成，且父目录不允许本应用写入（当前身份 UID ${uid_now}，容器用户 UID ${data_uid}）。
