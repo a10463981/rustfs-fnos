@@ -276,6 +276,28 @@ ls -d /vol1/@appdata/rustfs-fnos/data.bak-* 2>/dev/null
 
 ---
 
+## 八点五、ARM 设备与「同一个包通用」的说明
+
+从 `1.0.4-2` 起，安装包文件名是 `rustfs-fnos-<版本>-all.fpk`，**x86_64 与 aarch64 通用**（包内没有架构相关二进制，镜像由设备自己按架构拉取）。
+
+⚠️ **ARM 设备上我们没做过真机验证**（手头没有 arm 机器）。能保证的是：构建通过、脚本里没有架构相关的硬编码（`install_init` 会按设备架构放行，不再硬拒 arm）。装完请按下面 7 条自测。
+
+### ARM 自测清单（3 分钟）
+
+| # | 命令 | 期望 |
+|---|---|---|
+| 1 | `uname -m` | `aarch64`（x86 设备则是 `x86_64`） |
+| 2 | `docker version --format '{{.Server.Arch}}'` | `arm64`（x86 则是 `amd64`） |
+| 3 | `docker image inspect docker.io/rustfs/rustfs:1.0.4 --format '{{.Os}}/{{.Architecture}}'` | `linux/arm64`（x86 则是 `linux/amd64`） |
+| 4 | `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9200/health/ready` | `200` |
+| 5 | `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9201/app/rustfs-fnos/` | `200` |
+| 6 | `sudo ls -l /vol1/@appcenter/rustfs-fnos/app.sock` | `srw-` 开头，属主=应用用户 |
+| 7 | `docker ps --filter name=rustfs --format '{{.Names}}|{{.Status}}'` | `rustfs-fnos` 为 `Up (healthy)`，`rustfs-fnos-gateway` 为 `Up` |
+
+再点一次桌面图标：能在窗口内打开控制台、并能登录 → ARM 可用。
+
+任一条不符，请把 `docker ps -a`、`docker logs rustfs-fnos --tail 100`、`docker logs rustfs-fnos-gateway --tail 100` 反馈给维护者。
+
 ## 九、打开控制台、创建第一个桶
 
 1. 点桌面图标；或浏览器直接访问 `http://<NAS地址>:9201`。
