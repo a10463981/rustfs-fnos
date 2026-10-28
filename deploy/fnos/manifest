@@ -1,7 +1,7 @@
 appname                    = rustfs-fnos
 version                    = 0.0.0
 display_name               = RustFS
-desc                       = <p>RustFS 是 S3 兼容的高性能对象存储。安装时可自定义管理员账号密码、S3 API 端口、控制台端口，以及对象数据的存放目录。</p><p>S3 API：宿主默认 9200 → 容器 9000；Web 控制台：宿主默认 9201 → 容器 9001。两个端口都可以在安装向导里改。</p><p>数据目录安装时可选：默认放在应用数据目录（空间可能较小），也可以指定你自己的大容量存储空间下的目录——后者在卸载应用时不会被一并清理。</p>
+desc                       = <p>RustFS 是一个兼容 S3 的对象存储。装好后点桌面图标，即可在 fnOS 窗口内打开控制台。</p><p>可用作备份目标、媒体库或图床的后端，也可以给其它应用提供对象存储。</p><p>安装时只需设置管理员账号密码与端口；数据默认存在应用自己的目录里，装好后可在「应用设置」里改到你自己的存储空间。</p>
 source                     = thirdparty
 platform                   = x86
 maintainer                 = rustfs
@@ -13,7 +13,7 @@ desktop_uidir              = ui
 desktop_applaunchname      = rustfs-fnos.console
 service_port               = 9200
 checkport                  = false
-changelog                  = 1.0.4：点桌面图标可在飞牛 fnOS 窗口内打开并登录控制台；安装时可自定义管理员账号密码、S3 API 端口、控制台端口、访问来源与数据目录
+changelog                  = 1.0.4-1：安装向导不再让你选数据目录（装完在应用设置里改，更不容易出错）；应用说明精简；修复全新机器用默认数据位置装不上
 # ---- 关于 service_port / checkport 的说明（改前必读）----
 # service_port 是静态字段，向导改不了它；它只用于「默认值展示」。
 # 真正的 API 端口真源是 settings.env 的 API_PORT（用户在向导里填），优先级：
