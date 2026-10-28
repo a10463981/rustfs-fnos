@@ -20,9 +20,63 @@ env:
   FN_PACK_SHA256: "54b97fa7b70968c4d05c79840f5daeff508957d0bb2062fdb0376d00d9615c93"
   FNOS_DIR: "deploy/fnos"
   APPNAME: "rustfs-fnos"
-  PLATFORM: "x86"
+  PLATFORM: "all"            # 在线版：包内无架构二进制，一个包通吃 x86_64 / aarch64
 
 jobs:
+  # ===========================================================================
+  # 离线版（把镜像打进 fpk）——**尚未启用**，`if: false` 就是开关。
+  #
+  # 启用前必须先确认（否则装不上，白忙）：
+  #   应用中心安装时会把包复制到 /tmp/appcenter.pack.<reqid>/，
+  #   若 /tmp 是 tmpfs（内存盘），~130 MB 的包会吃内存甚至直接写失败。
+  #   核实：df -h /tmp；再用一个 130 MB 的假 fpkg 实测一次安装 + du -sh /tmp 峰值。
+  #
+  # 为什么拆成两个 job（而不是一个 job 里跑两次）：
+  #   `docker pull --platform` 会**覆盖本地同 tag**。同一台 runner 上先 save amd64
+  #   再 pull arm64，一旦顺序写反就会把 arm 层当成 x86 打进包（且体积、文件名都正常，
+  #   极难发现）。两个 job 各用一台干净 runner，物理上不可能串味。
+  #
+  # 启用时要补的步骤：stamp --platform / preflight / fnpack build / 上传资产，
+  #   与在线 job 相同，只是 FPK_ASSET 带 -offline 后缀。
+  # ===========================================================================
+  offline:
+    if: false                     # ← 启用：删掉这一行
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { fpk_platform: x86, docker_platform: "linux/amd64", arch: amd64 }
+          - { fpk_platform: arm, docker_platform: "linux/arm64", arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 拉取对应架构的上游镜像
+        run: |
+          set -euo pipefail
+          # 镜像 tag 必须与 app/docker/docker-compose.yaml 的 image 一致（当前 1.0.4）
+          docker pull --platform ${{ matrix.docker_platform }} docker.io/rustfs/rustfs:1.0.4
+          docker pull --platform ${{ matrix.docker_platform }} nginx:1.27-alpine
+
+      - name: 导出内置镜像到 app/images（唯一能被 fnpack 收进包的位置）
+        run: |
+          set -euo pipefail
+          mkdir -p "${FNOS_DIR}/app/images"
+          docker save docker.io/rustfs/rustfs:1.0.4 | gzip -1 > "${FNOS_DIR}/app/images/rustfs-1.0.4-linux-${{ matrix.arch }}.tar.gz"
+          docker save nginx:1.27-alpine              | gzip -1 > "${FNOS_DIR}/app/images/nginx-1.27-alpine-${{ matrix.arch }}.tar.gz"
+          ls -lh "${FNOS_DIR}/app/images/"
+          # 期望：rustfs ~110 MB、nginx ~19 MB。注意 fnpack 只收 app/** 下的内容，
+          # 放到 fpk 根或 payload/ 会被**静默丢弃**（实测，不报错）。
+
+      - name: 校验架构（防止串味）
+        run: |
+          set -euo pipefail
+          got="$(docker image inspect docker.io/rustfs/rustfs:1.0.4 --format '{{.Architecture}}')"
+          echo "导出的镜像架构：${got}（期望 ${{ matrix.arch }}）"
+          [ "${got}" = "${{ matrix.arch }}" ] || { echo "架构不符，中止"; exit 1; }
+
   release:
     runs-on: ubuntu-24.04          # x86_64
     timeout-minutes: 30
@@ -44,9 +98,8 @@ jobs:
             exit 1
           fi
           VERSION="${TAG#v}"
-          # v1.0.4-1 起：本项目的 `-N` 是**同一上游镜像的打包修订号**，不是上游预览版，
-          # 因此 vX.Y.Z 与 vX.Y.Z-N 一律按**正式版**发布（prerelease=false、latest=true）。
-          # 上游那种 1.0.4-preview.1 的语义与本项目无关，不要混用。
+          # 本项目的 `-N` 是**同一上游镜像的打包修订号**，不是上游预览版 →
+          # vX.Y.Z 与 vX.Y.Z-N 一律按正式版发布（与 main 上的修复一致）。
           echo "PRERELEASE=false" >> "${GITHUB_ENV}"
           echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
           echo "FPK_ASSET=${APPNAME}-${VERSION}-${PLATFORM}.fpk" >> "${GITHUB_ENV}"

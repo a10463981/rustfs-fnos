@@ -3,7 +3,7 @@ version                    = 0.0.0
 display_name               = RustFS
 desc                       = <p>RustFS 是一个兼容 S3 的对象存储。装好后点桌面图标，即可在 fnOS 窗口内打开控制台。</p><p>可用作备份目标、媒体库或图床的后端，也可以给其它应用提供对象存储。</p><p>安装时只需设置管理员账号密码与端口；数据默认存在应用自己的目录里，装好后可在「应用设置」里改到你自己的存储空间。</p>
 source                     = thirdparty
-platform                   = x86
+platform                   = all
 maintainer                 = rustfs
 maintainer_url             = https://github.com/rustfs/rustfs
 distributor                = a10463981
@@ -24,6 +24,9 @@ changelog                  = 1.0.4-1：安装向导不再让你选数据目录�
 # 端口实际生效方式：cmd/install_callback 与 config_callback 把端口「渲染」进
 #   app/docker/docker-compose.yaml 的 ports 两行，再重建容器（compose 读不到 settings.env，不能赌插值）。
 #
+# platform=all 的语义：**包内没有架构相关二进制**（在线版只有 manifest/compose/shell/图标/网关配置），
+#   所以一个包可以同时装在 x86_64 与 aarch64 上；离��版内含架构镜像层，出包时由 CI 用
+#   stamp-manifest.sh --platform x86|arm 覆盖（仓库里保持 all，因为它代表“默认形态”）。
 # 待测试机回填：os_min_version / os_max_version 当前不声明 = 不做兼容性承诺。
 # 发布时必须确保 README 写明「仅在实测过的 fnOS 版本上验证」，否则相当于对全版本做隐含承诺。
 # os_min_version           =

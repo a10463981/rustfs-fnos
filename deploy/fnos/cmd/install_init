@@ -469,12 +469,125 @@ if command -v docker >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1
   warn "docker compose 不可用（需要 Compose v2）。应用由应用中心托管启动，缺少它会导致启动失败。"
 fi
 
-# 3) 架构：首版只发 x86
-arch="$(uname -m)"
-case "${arch}" in
-  x86_64|amd64) : ;;
-  *) fail "本包仅支持 x86 设备（当前架构 ${arch}）。请不要在 ARM 设备上安装。" ;;
-esac
+# 3) 架构：按**包形态**判断，不是写死 x86
+#   · 在线版（platform=all，包内没有内嵌镜像）→ amd64 / arm64 都接受；其它架构 WARN 但继续
+#     （all 的语义就是“不承诺但可试”，硬拒会把未来可能能跑的设备挡在门外）
+#   · 离线版（app/images/ 里有内嵌镜像）→ 只接受与镜像架构一致的设备，否则明确让用户换包
+normalize_arch() { # 把 uname -m 归一成 amd64 / arm64；其它原样输出
+  case "$(uname -m)" in
+    x86_64|amd64)  printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    *)             uname -m ;;
+  esac
+}
+
+embedded_image_archs() { # 列出 app/images 里内嵌镜像的架构（amd64/arm64，空格分隔）；无则空
+  local dir="${TRIM_APPDEST}/images" f a out=""
+  [ -d "${dir}" ] || return 0
+  for f in "${dir}"/*.tar.gz "${dir}"/*.tar; do
+    [ -f "${f}" ] || continue
+    case "$(basename "${f}")" in
+      *-amd64.tar.gz|*-amd64.tar) a="amd64" ;;
+      *-arm64.tar.gz|*-arm64.tar) a="arm64" ;;
+      *)                          a="" ;;
+    esac
+    [ -n "${a}" ] || continue
+    case " ${out} " in *" ${a} "*) : ;; *) out="${out} ${a}" ;; esac
+  done
+  printf '%s' "${out# }"
+}
+
+check_arch() {
+  local arch embs
+  arch="$(normalize_arch)"
+  embs="$(embedded_image_archs)"
+  if [ -z "${embs}" ]; then
+    # 在线版：一个包通吃（包内只有 compose / 脚本 / 图标 / 网关配置）
+    case "${arch}" in
+      amd64|arm64)
+        trace "arch check ok arch=${arch} mode=online"
+        return 0 ;;
+      *)
+        warn "本应用未在 ${arch} 架构上验证过（官方镜像对其它架构的支持情况未知）。安装会继续；
+  如果启动失败，请把 docker logs rustfs-fnos --tail 100 反馈给维护者。"
+        trace "arch check warn arch=${arch} mode=online"
+        return 0 ;;
+    esac
+  fi
+  # 离线版：必须与内嵌镜像架构一致
+  case " ${embs} " in
+    *" ${arch} "*)
+      say "检测到本机架构 ${arch}，与包内镜像架构一致。"
+      trace "arch check ok arch=${arch} mode=offline embs=${embs}"
+      return 0 ;;
+    *)
+      fail "这个离线包内置的是【${embs}】架构的镜像，与当前设备（${arch}，$(uname -m)）不一致，装上去也起不来。
+  处理：下载与你设备架构一致的离线包 ——
+    · x86 / x86_64 设备 → 文件名含 -x86-offline 的那个
+    · ARM / aarch64 设备 → 文件名含 -arm-offline 的那个
+  或者改用在线版（文件名含 -all），它会在安装时按设备架构自行下载镜像。" ;;
+  esac
+}
+
+check_arch
+
+# ---- 离线版：加载内嵌镜像 + 磁盘预检（在线版自动短路）----
+# 为什么必须在 install_init 里做：真实时序是 install_init → **平台按模板 compose 拉起容器** →
+# install_callback。如果等到 install_callback 才 load，平台那次拉起时还没有镜像 → 会去 pull，
+# 离线版的全部意义就没了。
+load_embedded_images() {
+  local dir="${TRIM_APPDEST}/images" f base have arch
+  [ -d "${dir}" ] || return 0                       # 在线版：没有 images 目录 → 直接跳过
+  command -v docker >/dev/null 2>&1 || { warn "没有 docker，跳过内嵌镜像加载"; return 0; }
+
+  arch="$(normalize_arch)"
+
+  # 磁盘预检：包内压缩镜像 ~130 MB（已在 APPDEST）+ 解压后 ~350 MB（docker 根目录），留到 2 GB 更实际
+  local docker_root avail_docker
+  docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)"
+  avail_docker="$(df -Pk "${docker_root}" 2>/dev/null | awk 'NR==2{print $4}')"
+  if [ -n "${avail_docker}" ] && [ "${avail_docker}" -lt 2097152 ]; then
+    fail "docker 数据目录所在分区空间不足：${docker_root} 只剩 $(( avail_docker / 1024 )) MiB（离线版安装需要 ≥2 GB 空闲）。
+  处理：清理该分区，或改用在线版安装包（它不占这部分空间，镜像由 docker 按需下载）。"
+  fi
+
+  for f in "${dir}"/*.tar.gz "${dir}"/*.tar; do
+    [ -f "${f}" ] || continue
+    # 文件名带架构后缀时，只加载与本机匹配的（避免把 arm 镜像 load 到 x86）
+    case "$(basename "${f}")" in
+      *-amd64.tar.gz|*-amd64.tar|*-arm64.tar.gz|*-arm64.tar)
+        case "$(basename "${f}")" in
+          *-"${arch}".tar.gz|*"-${arch}".tar) : ;;
+          *) trace "skip image $(basename "${f}")（架构不匹配 ${arch}）"; continue ;;
+        esac ;;
+    esac
+
+    base="$(basename "${f}")"
+    # 幂等：能推断出镜像名且本机已有 → 跳过（重装/升级省 10–40 秒）
+    case "${base}" in
+      rustfs-*) have="docker.io/rustfs/rustfs:1.0.4" ;;
+      nginx-*)  have="nginx:1.27-alpine" ;;
+      *)        have="" ;;
+    esac
+    if [ -n "${have}" ] && docker image inspect "${have}" >/dev/null 2>&1; then
+      say "镜像已存在，跳过加载：${have}"
+      continue
+    fi
+
+    say "正在加载内嵌镜像（${base}，首次安装稍慢）…"
+    trace "docker load ${f}"
+    if ! gzip -dc "${f}" 2>/dev/null | docker load >>"${LOG_FILE:-/dev/stderr}" 2>&1; then
+      if ! docker load -i "${f}" >>"${LOG_FILE:-/dev/stderr}" 2>&1; then  # 兼容未压缩 tar
+        fail "内嵌镜像加载失败：${f}
+  可能原因：① 安装包在传输中损坏（请核对 sha256）；② docker 数据目录空间不足（需要约 2 GB）；
+           ③ docker 服务异常（先试 docker info 能否正常执行）。
+  处理：核对 sha256 后重装；仍失败请把这段日志反馈给维护者。"
+      fi
+    fi
+  done
+  return 0
+}
+load_embedded_images
 
 # 4) 端口占用：9200 来自 manifest.service_port；控制台端口来自向导
 port_busy() {
