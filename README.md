@@ -203,11 +203,25 @@ cd rustfs-fnos
 
 如果你只是想验证下载到的包没被动过手脚，看 **[docs/verify.md](docs/verify.md)**。
 
+## 文档
+
+| 想了解 | 看这里 |
+|---|---|
+| 装/升级/卸载的完整步骤、向导每个字段 | [docs/install-fnos.md](docs/install-fnos.md) |
+| 数据到底落在哪、怎么搬、`data.old-*` 是什么 | [docs/data-location.md](docs/data-location.md) |
+| 高频问题直答 | [docs/faq.md](docs/faq.md) |
+| 升级前后该做什么、失败了怎么退 | [docs/upgrade-safety.md](docs/upgrade-safety.md) |
+| 自己构建与打包（fnpack、stamp、preflight） | [docs/build.md](docs/build.md) |
+| 校验下载到的包没被动过手脚 | [docs/verify.md](docs/verify.md) |
+| 上游许可与本项目的分发边界 | [docs/licensing.md](docs/licensing.md) |
+| 遇到报错先查这里（按症状检索的踩坑总览） | [docs/pitfalls.md](docs/pitfalls.md) |
+| 项目归档：最终状态、文档地图、已作废的旧结论 | [docs/ARCHIVE.md](docs/ARCHIVE.md) |
+
 ## 已知限制
 
 | 限制 | 说明 |
 |---|---|
-| 仅 x86 | ARM 设备不支持。上游镜像是否提供其它架构，以镜像仓库页面为准。 |
+| ARM 未真机验证 | 从 `1.0.4-2` 起发布包为 `platform=all`，**同一个包也适用于 aarch64 设备**；但项目侧没有 ARM 机器，**未做真机验证**。装完请按 [docs/install-fnos.md](docs/install-fnos.md) 的「ARM 自测清单」逐条确认。上游镜像是否提供其它架构，以镜像仓库页面为准。 |
 | **安装/升级失败可能删除数据与配置** | 安装/升级若在「应用初始化」阶段失败，平台回滚会删除本应用的数据目录与配置目录（含桶与对象、含凭据）。**已确认**的是「先卸载再安装、且安装阶段失败」这条路径（真机复现，另有「失败在更早阶段、数据完好」的对照）；**应用中心升级失败是否同样回滚尚未确认，按最坏情况准备**。**把数据目录设到你自己的存储空间可规避此风险**（见 [docs/install-fnos.md](docs/install-fnos.md) 的「数据放哪里」）。预防与恢复做法见上面「⚠️ 升级前必做：先备份数据（30 秒）」。 |
 | **升级期间服务中断** | 升级要重建容器，这期间 9200/9201 都不可用，通常几秒到几十秒。建议在维护窗口做。 |
 | **回滚只还原镜像** | 应用能回退的是「容器用哪个镜像」；端口、环境变量、数据目录路径这些配置**不会**被还原。回滚后如果发现配置也不对，需要人工核对。 |
