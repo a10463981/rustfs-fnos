@@ -4,6 +4,31 @@
 
 ---
 
+## 1.0.4-3
+
+packaging-only: 修复网关侧车在容器重建后因陈旧 `app.sock` 反复重启；镜像未变，仍是 `rustfs/rustfs:1.0.4`。
+
+**版本号约定**：前三段对齐上游镜像版本（当前 `1.0.4`），`-N` 是本项目自己的打包修订号。
+本版 `-3` 相对 `-2` 只改了 compose 的启动命令、`cmd/main` 的 status 告警与文档，**镜像一个字节都没变**。
+
+### 修复
+
+- **窗口内打开会「装完过一阵子就打不开」**：gateway 容器日志反复刷 `bind() to unix:/sock/app.sock failed (98: Address in use)`，每 5–60 秒重启一次。
+  - 根因：`app.sock` 落在 `${TRIM_APPDEST}`（持久目录），容器被杀/重建后文件仍留着；而对 AF_UNIX，`bind()` **只要路径已存在就报 `EADDRINUSE`，不检查有没有人在监听**，nginx 又不会自己 unlink → 永久失败。
+  - 真机复现：`11-09` 一次非正常退出留下路径名，gateway 累计重启 **298 次**；`rm -f` 掉该文件 + 「停止 → 启动」后立即恢复（`via-socket`/`api`/`console` 全 200，`restarts` 归零）。
+  - 修法：gateway 的 `command` 改为「启动前 `rm -f /sock/app.sock` → 校验已消失且 **容器内** `/proc/net/unix` 中无该路径 → `exec nginx`」。**删完必须再验一次**：仍被占用就在 5 秒后打印 `ls -l`、目录可写性、`/proc/net/unix` 片段并退出，而不是把「双监听者」掩盖成「控制台时好时坏」。
+  - 老版本（`1.0.4-2` 及更早）仍会复现：手工 `sudo rm -f /vol*/@appcenter/rustfs-fnos/app.sock` 后「停止 → 启动」即可。
+
+### 新增
+
+- `cmd/main status` 把「gateway 容器反复重启」记为 **WARN（不影响退出码）**：判据是 `docker inspect` 的 `Status` + `RestartCount > 3`，按 `${状态}:${重启次数}` 指纹去重，每次真实重启只记一行。窗口内打不开不等于应用故障 —— S3 API 与控制台直连照常可用。
+- `docs/pitfalls.md` 新增 **P21**（按症状检索）+ 症状速查表一行；**判据已按真机反证纠正**：宿主 `ss -xlp | grep app.sock` 是**假阴性**（unix socket 属于容器 netns），要看 `gateway` 的 `restarts`、`app.sock` 的 mtime，以及**容器内** `/proc/net/unix`。`docs/faq.md`「窗口内打不开」补一条指向 P21，并附三条可直接粘贴的自查命令 + 钉死排查顺序（容器在不在 → socket 冲突 → 才看配置）。
+
+### 发布
+
+- **本次不含镜像变更**（`rustfs/rustfs:1.0.4` 未变），发布闸按 `packaging-only` 例外放行（`--allow-same-image`）。
+- 升级后 gateway 容器会按新 `command` 重建，**不需要**先手工删 socket。
+
 ## 1.0.4-2
 
 packaging-only: 加入 ARM / 全架构支持（platform=all）；镜像未变，仍是 `rustfs/rustfs:1.0.4`。

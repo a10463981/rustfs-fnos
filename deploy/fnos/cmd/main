@@ -246,6 +246,26 @@ case "$1" in
       warn "排查：docker logs rustfs-fnos-gateway；docker ps --filter name=rustfs-fnos-gateway"
     fi
 
+    # gateway 容器反复重启 —— 同上，只记 WARN，**不参与成败判定**（它只管「窗口内打开」）。
+    # 判据用 docker inspect 的 Status + RestartCount，不去 grep nginx 日志：日志会轮转，
+    # 且 "Address in use" 是英文版 nginx 的实现细节，未来可能变。
+    # 阈值 >3 是为了避开首次安装/拉镜像期间的正常重建；容器还不存在时（安装早期）不告警。
+    # 去重是必须的：status 会被平台高频调用，同一条 WARN 每次重写会把 TRIM_PKGVAR 刷满。
+    gw_state="$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' rustfs-fnos-gateway 2>/dev/null || true)"
+    gw_status="${gw_state%% *}"
+    gw_restarts="${gw_state##* }"
+    case "${gw_restarts}" in '' | *[!0-9]*) gw_restarts=0 ;; esac
+    if [ -n "${gw_state}" ] && [ "${gw_status}" != "running" ] && [ "${gw_restarts}" -gt 3 ]; then
+      gw_msg="gateway 容器反复重启（状态 ${gw_status}，RestartCount=${gw_restarts}）：窗口内打不开控制台，S3 API 与控制台直连不受影响。排查：docker logs rustfs-fnos-gateway；ls -l ${TRIM_APPDEST}/app.sock；sudo ss -xlp | grep app.sock；见 docs/pitfalls.md P21"
+      # 去重靠状态文件而不是 grep 日志：LOG_FILE 是「本次操作」的临时日志，可能被重置；
+      # 用 `${状态}:${重启次数}` 做指纹 → 每次真实重启只记一行，与 status 被调多少次无关。
+      gw_flag="${VAR_DIR}/.gateway-restart-warned"
+      if [ "$(cat "${gw_flag}" 2>/dev/null)" != "${gw_status}:${gw_restarts}" ]; then
+        warn "${gw_msg}"
+        { mkdir -p "${VAR_DIR}" && printf '%s' "${gw_status}:${gw_restarts}" >"${gw_flag}"; } 2>/dev/null || true
+      fi
+    fi
+
     declared_ref="$(compose_image)"
     actual_ref="$(container_image_ref)"
     declared_id=""

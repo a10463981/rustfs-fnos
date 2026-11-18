@@ -21,6 +21,7 @@
 | 重装后要手动改「服务器地址」 | P13 |
 | 卸载后以为数据被删了 | P14 |
 | 卸载后重装，镜像没了 / 要重新登录 | P15 |
+| 应用在运行，点图标却 `Bad Gateway`，gateway 反复重启 | P21 |
 | `fnpack build` 明明失败，脚本却继续往下跑 | P16 |
 | 版本号写不进去 / 写进去后版本变了 | P17 |
 | 本地一切正常，CI 报权限错误 | P18 |
@@ -192,6 +193,34 @@
 - **怎么确认**：`grep -n 'x86' cmd/install_init`；`uname -m` 确认设备架构。
 - **修法**：改为按**包形态**判断——在线版接受 `amd64`/`arm64`，其它架构 `WARN` 但继续；离线版按包内镜像的实际架构校验（`normalize_arch` / `check_arch`）。
 - **状态**：已修复（`v1.0.4-2`，`platform=all`）。**注意：ARM 是「可安装」而非「已真机验证」**，Release 说明里给了 7 条自测，尚无 arm 设备跑过。
+
+---
+
+## G. 统一网关（窗口内打开）
+
+### P21 窗口内打不开 / `Bad Gateway`：gateway 容器反复 `bind() to unix:/sock/app.sock failed (98: Address in use)`
+- **症状**：应用中心显示运行中、S3 API 与控制台直连都正常，但点桌面图标是 `502 Bad Gateway`；`docker logs rustfs-fnos-gateway` 里同一段反复刷屏——`bind() to unix:/sock/app.sock failed (98: Address in use)` → `[notice] try again to bind() after 500ms`（连试 5 次）→ `[emerg] still could not bind()` → 容器退出 → 重启，间隔从几秒退避到约一分钟，持续数分钟以上。
+  **真机实证**：`11-09` 一次非正常退出留下了 `app.sock` 的路径名，gateway 累计重启 **298 次**；宿主 `rm -f` 掉那个文件 + 「停止 → 启动」后立即恢复（`via-socket`/`api`/`console` 全部 200，`restarts` 归零）。
+- **根因**：`app.sock` 落在 `${TRIM_APPDEST}`（`/vol*/@appcenter/rustfs-fnos`，**持久目录**），容器被杀或重建不会带走它。关键在内核语义：**对 AF_UNIX，`bind()` 只要发现路径已存在就直接返回 `EADDRINUSE`，它不检查有没有进程在监听** —— 所以一个死进程留下的 socket 文件（甚至一个普通文件）就足以让 nginx 永远起不来，而 nginx 不会替你先 unlink。日志里的 `try again after 500ms` 容易让人误以为是「瞬时竞争」，其实不是。
+- **怎么确认**（三条，全部在宿主侧执行即可，不会误判）：
+  1. **容器状态 + 重启计数**（最有区分力）：
+     `sudo docker inspect -f '{{.Name}} state={{.State.Status}} restarts={{.RestartCount}} started={{.State.StartedAt}}' rustfs-fnos-gateway`
+     —— `state=restarting` 且 `restarts` 在持续增长、日志里有 `[emerg] bind() ... (98: Address in use)`，就是陈旧 socket。
+  2. **`app.sock` 的 mtime 与容器本次启动时间对比**：
+     `stat -c '%n mtime=%y' /vol/*/@appcenter/rustfs-fnos/app.sock`
+     —— **socket 的 mtime 明显早于**上面那条里的 `started=` ⇒ 它是上一代容器留下的死文件（活着的监听者一定是「本次启动之后」才 bind 的）。
+  3. **容器内视角看谁在监听**（真·占用判定，**必须在容器里跑**）：
+     `sudo docker exec rustfs-fnos-gateway sh -c 'grep -F app.sock /proc/net/unix || echo NOT-LISTENING'`
+     —— 输出 `NOT-LISTENING` = 没有活着的监听者（死文件）；命中一行 = 确有进程占着它（此时删文件没用，去查重复容器）。
+     注意 `nginx:alpine` **没有 `ss`**（那是 iproute2），只能用 `grep /proc/net/unix`（或 busybox 的 `netstat -xl`）。
+  附一条功能判据：`sudo curl -sS --unix-socket /vol*/@appcenter/rustfs-fnos/app.sock -o /dev/null -w '%{http_code}\n' http://localhost/app/rustfs-fnos/` —— 返回 `200` 说明 socket 是活的且能服务，故障不在这一层。
+- **⚠️ 不要用宿主侧的 `ss -xlp | grep app.sock` 判断**：它会给出**假阴性**。unix socket 的监听者记在**创建它的 netns 的**内核 socket 表里；`app.sock` 之所以在宿主目录里看得见，只是因为 `/sock` 是个 bind mount（**共享文件系统，不共享 netns**）。所以宿主 `ss -x` / 宿主 `/proc/net/unix` 永远看不到容器里的这个 socket，无输出**不能**说明「没人监听」。
+  - 真机实测对照（同一时刻，`.212`，全部只读）：容器内 `grep app.sock /proc/net/unix` 命中 **1 条**、`netstat -xl` 命中 **1**；宿主 `ss -x` / 宿主 `/proc/net/unix` 命中 **0**；而 `curl --unix-socket` 返回 **200**。三组数据同时成立 —— 宿主视角就是看不见。
+- **修法**：`v1.0.4-2` 及更早——手工 `sudo rm -f /vol*/@appcenter/rustfs-fnos/app.sock`，然后在应用中心「停止 → 启动」，一次即可恢复；若删完仍报同样错误，按上面第 3 条进容器确认是否真有第二个监听者（以及 `ls -ld /vol*/@appcenter/rustfs-fnos` 看属主是否被重置，属主不对时 `rm` 也会失败）。
+  `v1.0.4-3` 起 gateway 容器**启动前自动清理**：删掉 → 校验「文件已消失」且**容器内** `/proc/net/unix` 中无该路径 → `exec nginx`；5 秒内仍被占用则打印 `ls -l`、目录可写性、`/proc/net/unix` 片段并 `exit 1`，**不抢路径、不掩盖双监听**。
+- **状态**：**已修复**（`v1.0.4-3` 起容器启动前自动清理）；对 `v1.0.4-2` 及更早 → **仍有边界（需手工删一次）**。
+- 附：同屏那两条非致命信息不是线索——`10-listen-on-ipv6-by-default.sh: info: can not modify /etc/nginx/conf.d/default.conf (read-only file system?)` 是我们**故意**把 `gateway.conf` 只读挂成 `default.conf`（顺带挡住了镜像 entrypoint 往里注入 `listen 80`），我们的 conf 自带 `listen unix:/sock/app.sock;`，不依赖它改写；`the "user" directive ... ignored` 是基础镜像 `nginx.conf` 的 `user` 在非 root 主进程下被忽略，正是预期行为。
+- 附（**判据本身踩过坑，别再重复**）：本条目第一版把「宿主 `ss -xlp | grep app.sock` 无输出」当成「死文件」的判据，**这是错的**，已被真机反证推翻（宿主 0 条 / 容器内 1 条 / `curl --unix-socket` 200 同时成立）。错因是忽略了「socket 属于容器 netns，bind mount 只共享文件系统」。改判据时请牢记：**凡是要看「谁在监听」，都必须进容器看；宿主侧只能看容器状态、重启计数和文件 mtime。**
 
 ---
 

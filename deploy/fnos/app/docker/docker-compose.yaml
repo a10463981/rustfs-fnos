@@ -86,6 +86,54 @@ services:
     image: nginx:1.27-alpine
     container_name: rustfs-fnos-gateway
     user: "${TRIM_UID:?TRIM_UID missing}:${TRIM_GID:?TRIM_GID missing}"
+    # 启动前清掉陈旧 socket（P21）——否则容器重建后就再也起不来：
+    #   对 AF_UNIX，bind() 只要**路径已存在**就返回 EADDRINUSE，它**不检查有没有人在监听**；
+    #   而 app.sock 落在 ${TRIM_APPDEST}（持久目录），容器被杀/重建不会带走它。
+    # 为什么不写成一行 `rm -f /sock/app.sock && exec nginx`：
+    #   一行式能治好「死文件」，但真有两个监听者时会把冲突掩盖成「控制台时好时坏」，
+    #   比直接报错难查得多。所以这里是「删完再验一次」：仍被占用 → 打印证据并退出，
+    #   绝不抢路径、绝不静默吞掉冲突。
+    # 为什么下面的判据读 /proc/net/unix（而不是 ss）：
+    #   ① 这段命令是**在 gateway 容器里**跑的，和 nginx 同一个 netns —— 看得见这个 socket；
+    #      反过来，宿主上的 `ss -x` / 宿主 /proc/net/unix **永远看不到**它
+    #      （bind mount 只共享文件系统，不共享 netns）。别把这段判据「优化」成宿主侧检查。
+    #   ② nginx:alpine 里没有 ss（那是 iproute2），只有 busybox 的 netstat，对 unix socket 不可靠。
+    # 退出码说明：exit 1 仍会触发 restart 退避重试（约每分钟一次，日志里留可读 FATAL）；
+    #   想「干净停下不重试」把最后一处 exit 1 改成 exit 0 即可（控制台保持不可用，点「启动」再试）。
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -u
+        SOCK=/sock/app.sock
+
+        # ① 正常路径：上一次容器遗留的 socket 文件名，删掉即可（绝大多数情况到这里就结束）
+        if [ -e "$SOCK" ]; then
+          echo "[gateway] removing stale $SOCK"
+          rm -f "$SOCK" || true
+        fi
+
+        # ② 容忍「上一代 gateway 容器还在退出」的短暂窗口：最多等 5 秒
+        #    判据有两条：路径还存在（删不掉/又被建回来），或内核 unix socket 表里还有该路径
+        #    （后者说明确有活着的监听者，即使文件已被 unlink）。
+        i=0
+        while [ -e "$SOCK" ] || grep -qF "$SOCK" /proc/net/unix 2>/dev/null; do
+          i=$((i + 1))
+          if [ "$i" -gt 5 ]; then
+            echo "[gateway] FATAL: $SOCK 仍被占用，5 秒内无法接管" >&2
+            if [ -e "$SOCK" ]; then
+              ls -l "$SOCK" >&2 || true
+              [ -w /sock ] || echo "[gateway] 提示：/sock 对当前用户不可写 —— 可能是升级后目录属主被重置（见 docs/pitfalls.md P21）" >&2
+            fi
+            grep -F "$SOCK" /proc/net/unix >&2 || true
+            echo "[gateway] 判定：确有第二个监听者（常见于重复的 gateway 容器）。" >&2
+            echo "[gateway] 在设备（宿主）上执行：docker ps -a --filter name=gateway ; docker exec rustfs-fnos-gateway sh -c 'grep -F app.sock /proc/net/unix'" >&2
+            exit 1
+          fi
+          sleep 1
+        done
+
+        exec nginx -g 'daemon off;'
     tmpfs:
       - /var/cache/nginx:rw,size=16m,mode=777
       - /var/run:rw,size=4m,mode=777

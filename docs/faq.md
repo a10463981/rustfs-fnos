@@ -149,6 +149,29 @@ curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<控制台端口>/app/rus
 - 返回 **403** → 前缀没生效（控制台还挂在旧路径），多半是镜像版本或 env 没生效，重启应用；
 - 连不上 → 服务本身的问题，先看 `docker logs rustfs-fnos`。
 
+> **如果 `docker logs rustfs-fnos-gateway` 里反复出现 `bind() to unix:/sock/app.sock failed (98: Address in use)`**：
+> 这是宿主目录里遗留的 `app.sock` 挡住了 nginx 启动 —— **不是配置错，也不是权限问题**。
+> `v1.0.4-2` 及更早：`sudo rm -f /vol*/@appcenter/rustfs-fnos/app.sock`，再在应用中心「停止 → 启动」；
+> `v1.0.4-3` 起容器每次启动都会先清理，不需要手工干预。
+>
+> 判定方法看 **`gateway` 的 `restarts` 与 `app.sock` 的 mtime**（不要用宿主侧 `ss` 判断，见下方提醒）：
+>
+> ```bash
+> sudo docker inspect -f '{{.Name}} state={{.State.Status}} restarts={{.RestartCount}} started={{.State.StartedAt}}' rustfs-fnos-gateway
+> sudo docker exec rustfs-fnos-gateway sh -c 'grep -F app.sock /proc/net/unix || echo NOT-LISTENING'
+> sudo curl -sS --unix-socket /vol1/@appcenter/rustfs-fnos/app.sock -o /dev/null -w 'via-socket=%{http_code}\n' http://localhost/app/rustfs-fnos/
+> ```
+>
+> - 第 1 条：`state=restarting` 且 `restarts` 一直涨 ⇒ 就是这个故障；
+> - 第 2 条：`NOT-LISTENING` ⇒ 没有活着的监听者（死文件，删掉即可）；命中一行 ⇒ 真有人在占用，删文件没用，去查重复容器；
+> - 第 3 条：`via-socket=200` ⇒ 这一层是通的，别再往 socket 上找原因。
+> - 再补一眼：`stat -c '%n mtime=%y' /vol*/@appcenter/rustfs-fnos/app.sock`，mtime 明显早于第 1 条的 `started=` ⇒ 上一代容器留下的死文件。
+>
+> **⚠️ 不要在宿主机上用 `ss -xlp | grep app.sock` 判断**：unix socket 属于**容器的 netns**，`app.sock` 在宿主目录里看得见只是因为 bind mount 共享了文件系统。宿主看不到它，**无输出并不代表没人监听**（实测：容器内 1 条 / 宿主 0 条 / 功能 200 同时成立）。
+>
+> 排查顺序：**① 容器在不在 → ② 是不是这个 socket 冲突 → ③ 才去看 `gateway.conf` 和入口 `url`**，
+> 这条故障里配置本来就是对的，先改配置只会白折腾。完整版见 `docs/pitfalls.md` 的 **P21**。
+
 ### ② 窗口能打开，但登录一直失败
 
 **正常情况下你不需要填任何东西** —— 从 v17 起，窗口内打开时页面会**自动**把正确的服务器地址写进浏览器，直接输账号密码即可。
