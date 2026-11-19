@@ -241,6 +241,82 @@ else
   fi
 fi
 
+# ---------- 5d. compose 变量转义（compose 会插值 $，shell 变量必须写 $$） ----------
+section "5d compose 变量转义（\$ vs \$\$）"
+# 为什么必须有这一条：compose 会对所有字符串做变量插值，`command:` / `entrypoint:` 里的
+# shell 变量若写成单 `$NAME`，会被替换成**空串**——例如 `grep -qF "$SOCK"` 变成 `grep -qF ""`，
+# 空模式匹配一切 → while 永不退出 → 服务永远起不来。1.0.4-3 真的这么发出去过一次。
+# 这类错误一秒可测，所以定为 FAIL（不是 WARN）。
+COMPOSE_SCAN_AWK='
+function allowed(w) { return (w ~ /^wizard_/) || (w in WL) }
+function scan(s, nr,   n, i, c, nx, w, j) {
+  n = length(s); i = 1
+  while (i <= n) {
+    c = substr(s, i, 1)
+    if (c != "$") { i++; continue }
+    nx = substr(s, i + 1, 1)
+    if (nx == "$") { i += 2; continue }              # $$ 已转义，正确写法
+    if (nx == "{") {                                  # ${NAME...}
+      w = ""; j = i + 2
+      while (j <= n) { c = substr(s, j, 1); if (c ~ /[A-Za-z0-9_]/) { w = w c; j++ } else break }
+      if (w == "") { printf "FAIL\t%d\t${...}\t%s\n", nr, s }
+      else if (!allowed(w)) { printf "FAIL\t%d\t%s\t%s\n", nr, w, s }
+      i = j; continue
+    }
+    if (nx ~ /[A-Za-z_]/) {                            # $NAME
+      w = ""; j = i + 1
+      while (j <= n) { c = substr(s, j, 1); if (c ~ /[A-Za-z0-9_]/) { w = w c; j++ } else break }
+      if (!allowed(w)) { printf "FAIL\t%d\t%s\t%s\n", nr, w, s }
+      i = j; continue
+    }
+    printf "BARE\t%d\t%s\t%s\n", nr, nx, s             # $? $1 $@ $( …
+    i++
+  }
+}
+BEGIN {
+  split("TRIM_UID TRIM_GID TRIM_APPDEST TRIM_PKGVAR TRIM_PKGETC TRIM_PKGTMP TRIM_PKGHOME TRIM_PKGMETA TRIM_APPNAME TRIM_APPVER TRIM_TEMP_LOGFILE TRIM_SERVICE_PORT TRIM_DATA_SHARE_PATHS TRIM_OLD_APPVER TRIM_SYS_ARCH", _a, " ")
+  for (k in _a) WL[_a[k]] = 1
+  inb = 0; ind = 0
+}
+{
+  line = $0
+  if (match(line, /^[ \t]*(command|entrypoint)[ \t]*:/)) {
+    inb = 1
+    ind = match(line, /[^ \t]/) - 1
+    scan(line, NR)
+    next
+  }
+  if (inb) {
+    if (line ~ /^[ \t]*$/) next
+    cur = match(line, /[^ \t]/) - 1
+    if (cur <= ind && line ~ /^[ \t]*[A-Za-z_.-]+[ \t]*:/) { inb = 0; next }
+    scan(line, NR)
+  }
+}'
+compose_found=0
+for cf in app/docker/*.yaml app/docker/*.yml; do
+  [ -f "${cf}" ] || continue
+  compose_found=1
+  res="$(awk "${COMPOSE_SCAN_AWK}" "${cf}")"
+  n_fail=$(printf '%s\n' "${res}" | grep -c '^FAIL' || true)
+  n_bare=$(printf '%s\n' "${res}" | grep -c '^BARE' || true)
+  if [ "${n_fail}" -gt 0 ]; then
+    bad "${cf}: command/entrypoint 里有 ${n_fail} 处未转义的 \${VAR}（compose 会把它替换成空串 → 脚本退化）"
+    printf '%s\n' "${res}" | grep '^FAIL' | while IFS="$(printf '\t')" read -r _ ln var txt; do
+      printf '          %s:%s  变量 %s\n            %s\n' "${cf}" "${ln}" "${var}" "$(printf '%s' "${txt}" | sed 's/^[[:space:]]*//')"
+    done
+    printf '          修法：把脚本内的 shell 变量写成 $$NAME（compose 输出单个 $）；\n'
+    printf '                ${TRIM_*}/wizard_* 这类**本来就该由 compose 插值**的保留单 $。\n'
+  fi
+  if [ "${n_bare}" -gt 0 ]; then
+    warn "${cf}: command/entrypoint 里有 ${n_bare} 处裸 \$（\$? \$1 \$@ \$() ），当前 compose 版本会原样透传，建议统一写 \$\$ 更稳"
+  fi
+  if [ "${n_fail}" -eq 0 ] && [ "${n_bare}" -eq 0 ]; then
+    ok "${cf}: command/entrypoint 变量转义正确（无未转义 \${VAR}）"
+  fi
+done
+[ "${compose_found}" = "1" ] || warn "未找到 app/docker/*.yaml，跳过 compose 变量转义检查"
+
 # ---------- 6. 真实打包(退出码不可信, 按输出判定) ----------
 section "6 fnpack build"
 if command -v fnpack >/dev/null; then

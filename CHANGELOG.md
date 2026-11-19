@@ -4,7 +4,32 @@
 
 ---
 
-## 1.0.4-3
+## 1.0.4-4
+
+packaging-only: 修复 1.0.4-3 引入的 compose `$` 插值缺陷（gateway 启动脚本变量被替换成空串 → `grep -qF ""` 死循环 → 502）；`preflight` 新增 compose 变量转义闸。镜像未变，仍是 `rustfs/rustfs:1.0.4`。
+
+> **`1.0.4-3` 从未对外发布**（GitHub/Gitee 上都没有它的 tag 与 Release），本版是这条修复线的**首个对外版本**。
+> 若你从任何渠道拿到过 `1.0.4-3` 的包：**不要装**（装了必然 502），直接升级到 `1.0.4-4`。
+
+### 修复
+
+- **`1.0.4-3` 的严重回归**：gateway 的 `command:` 里 script 变量写成了单 `$`（`$SOCK`、`$i`），而 **compose 会对 `command:` 做变量插值**——没有同名 compose 变量就替换成空串。脚本因此退化成：
+  `if [ -e "" ]` / `grep -qF "" /proc/net/unix`（**空模式匹配任何行**）/ `[ "" -gt 5 ]`（`sh: out of range`），`while` 永不退出、`exec nginx` 永远到不了 → 无 `app.sock` → 点图标 **502**，且「重启应用」无效。
+  - 修法：脚本内 shell 变量一律写 `$$NAME`（`$$SOCK`×9、`$$i`、`$$((i + 1))`）；`${TRIM_UID:?...}`、`${TRIM_APPDEST}` 这类**该由 compose 插值**的保留单 `$`。修后 `docker inspect .Config.Cmd` 里空串为 **0 处**。
+  - 真机已验证：热修后 `api=200 / console=200 / via-socket=200`、`restarts=0`、数据 29 G 完好。
+
+### 新增
+
+- **`scripts/preflight.sh` 第 5d 节：compose 变量转义闸（FAIL 级）**。扫描 `app/docker/*.yaml` 的 `command:` / `entrypoint:` 段，命中未转义的 `$NAME` / `${NAME}`（白名单仅 `TRIM_*` 与 `wizard_*`）即 **FAIL 并打印行号 + 修法**；`$?`/`$1`/`$@`/`$()` 这类裸 `$` 记 WARN（当前 compose 会原样透传，但不同版本行为有差异，统一写 `$$` 更稳）。自测已做：把 `$$SOCK` 改回 `$SOCK` → FAIL（9 处，带行号）；注入 `$FOO` → FAIL；改 `$$FOO` → PASS；`${TRIM_APPDEST}` → PASS。
+- `docs/pitfalls.md` 新增 **P22**（compose `$` 插值 + 附注「`appcenter-cli stop/start` 不会重建容器」）；`docs/faq.md`「窗口内打不开」补一条指向 P22（升级后才出现 502 的那一类）。
+- `deploy/fnos/app/docker/docker-compose.yaml` 的 `command:` 段上方补了「compose 会插值 `$`，shell 变量一律 `$$`」的注释，防止再次踩坑。
+
+### 发布
+
+- **本次不含镜像变更**（`rustfs/rustfs:1.0.4` 未变），发布闸按 `packaging-only` 例外放行（`--allow-same-image`）。
+- **升级后必须重建 gateway 容器才生效**：升级流程本身会重建；手工修则用 `docker compose -p rustfs-fnos -f <compose> up -d --force-recreate --no-deps gateway`（`stop/start` 无效，见 P22-附）。
+
+## 1.0.4-3（**已作废，从未对外发布**）
 
 packaging-only: 修复网关侧车在容器重建后因陈旧 `app.sock` 反复重启；镜像未变，仍是 `rustfs/rustfs:1.0.4`。
 

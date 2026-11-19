@@ -21,6 +21,7 @@
 | 重装后要手动改「服务器地址」 | P13 |
 | 卸载后以为数据被删了 | P14 |
 | 卸载后重装，镜像没了 / 要重新登录 | P15 |
+| 升级后点图标 `502`，`docker logs` 满屏 `sh: out of range` | P22 |
 | 应用在运行，点图标却 `Bad Gateway`，gateway 反复重启 | P21 |
 | `fnpack build` 明明失败，脚本却继续往下跑 | P16 |
 | 版本号写不进去 / 写进去后版本变了 | P17 |
@@ -221,6 +222,33 @@
 - **状态**：**已修复**（`v1.0.4-3` 起容器启动前自动清理）；对 `v1.0.4-2` 及更早 → **仍有边界（需手工删一次）**。
 - 附：同屏那两条非致命信息不是线索——`10-listen-on-ipv6-by-default.sh: info: can not modify /etc/nginx/conf.d/default.conf (read-only file system?)` 是我们**故意**把 `gateway.conf` 只读挂成 `default.conf`（顺带挡住了镜像 entrypoint 往里注入 `listen 80`），我们的 conf 自带 `listen unix:/sock/app.sock;`，不依赖它改写；`the "user" directive ... ignored` 是基础镜像 `nginx.conf` 的 `user` 在非 root 主进程下被忽略，正是预期行为。
 - 附（**判据本身踩过坑，别再重复**）：本条目第一版把「宿主 `ss -xlp | grep app.sock` 无输出」当成「死文件」的判据，**这是错的**，已被真机反证推翻（宿主 0 条 / 容器内 1 条 / `curl --unix-socket` 200 同时成立）。错因是忽略了「socket 属于容器 netns，bind mount 只共享文件系统」。改判据时请牢记：**凡是要看「谁在监听」，都必须进容器看；宿主侧只能看容器状态、重启计数和文件 mtime。**
+
+---
+
+## H. 升级与容器重建（compose 变更类）
+
+### P22 升级后点图标 `502`、`docker logs` 满屏 `sh: out of range`：compose 把脚本里的 `$变量` 插值成了空串
+- **症状**：升级完成后应用显示「在运行」，主服务（S3 API、控制台直连）都 200，但点桌面图标是 `502 Bad Gateway`；`docker logs rustfs-fnos-gateway` 里没有 nginx 启动日志，只有**每行一条** `sh: out of range`；`app.sock` 根本不存在；`docker inspect` 的 `.Config.Cmd` 里能看到 `[ -e "" ]`、`grep -qF "" /proc/net/unix`、`[ "" -gt 5 ]` 这种**空串**。
+- **根因**：**compose 会对所有字符串做变量插值**，`command:` / `entrypoint:` 也不例外——脚本里的 shell 变量 `$SOCK`、`$i` 被当成 compose 变量，compose 里没有同名变量就替换成**空串**。后果链：`grep -qF ""` 是**空模式、匹配任何行** → `while` 永不退出 → 每轮 `[ "" -gt 5 ]` 报 `sh: out of range` → `exec nginx` 永远到不了 → 没有 `app.sock` → 502。
+  正确写法：**脚本内部 shell 变量一律 `$$NAME`**（compose 输出单个 `$`）；`${TRIM_UID:?...}`、`${TRIM_APPDEST}`、`${wizard_*}` 这类**本来就该由 compose 插值**的保留单 `$`。算术也要写 `$$((i + 1))`。
+- **怎么确认**（三条，按顺序）：
+  1. `sudo docker inspect -f '{{json .Config.Cmd}}' rustfs-fnos-gateway` —— 出现 `""` / `grep -qF ""` / `[ "" -gt 5 ]` 就是中招（这是**真机渲染后**的命令，唯一可信）；
+  2. `sudo docker logs --tail 20 rustfs-fnos-gateway` —— `sh: out of range` 刷屏（每轮一条）；
+  3. `ls -l /vol*/@appcenter/rustfs-fnos/app.sock` —— 不存在（nginx 从没起来过）。
+  **别拿 `docker compose config` 的输出判断对错**：它会把字面 `$` 重新转义成 `$$` 再打印，`$$SOCK` 和 `$SOCK` 在它的输出里看起来都「有 `$$`」，很容易看反。判据只认 `docker inspect .Config.Cmd`。
+- **修法**：把脚本内的 shell 变量全部改成 `$$NAME`（`$$SOCK`、`$$i`、`$$((i + 1))`），`${TRIM_*}`/`wizard_*` 保持单 `$`；改完**必须强制重建容器**（见下面的 P22-附，`stop/start` 不生效）。
+  - `v1.0.4-4` 起已修；并且 `scripts/preflight.sh` 新增了**第 5d 节硬闸**：扫描 `app/docker/*.yaml` 的 `command:`/`entrypoint:` 段，发现未转义的 `$NAME`/`${NAME}`（白名单只有 `TRIM_*` 与 `wizard_*`）就 **FAIL 并打印行号**，所以说这类错误以后一秒可测。
+  - 临时手动修（不升级）：确认 `.Config.Cmd` 里有空串后，改运行目录的 compose 再 `--force-recreate`；注意这只是一次性止损，下次安装会被包内文件覆盖。
+- **状态**：**已修复**（`v1.0.4-4` 起已修正 + `preflight` 加闸）。对 `v1.0.4-3`：**已作废，不要用**——那个包从未对外发布，谁装谁 502。
+
+#### P22-附（相关但独立的坑）：`appcenter-cli stop/start` **不会重建容器**
+- **症状**：改完 `command:` / 换了新包 / 升级完成后，在应用中心「停止 → 启动」或 `appcenter-cli stop` + `start`，**问题一点没变**，`docker logs` 还是旧的报错。
+- **根因**：stop/start 只是把**同一个容器**再启一次，不会按新的 compose 定义重建；`command:`、`entrypoint:`、`image:`、`volumes:` 这类**创建期**属性只有重建才生效。
+- **怎么确认**：`sudo docker inspect -f '{{.Created}}' rustfs-fnos-gateway` —— 若这个时间**早于**你升级/改文件的时间，说明容器根本没换；再配合 `docker inspect -f '{{json .Config.Cmd}}'` 看命令是不是还是旧的。
+- **修法**：显式重建（不带服务名会连带主容器，按需加 `--no-deps`）：
+  `sudo docker compose -p rustfs-fnos -f /vol*/@appcenter/rustfs-fnos/docker/docker-compose.yaml up -d --force-recreate --no-deps gateway`
+  重建后确认 `.Created` 变了、`.Config.Cmd` 里没有空串、`app.sock` 重新出现。
+- **状态**：**仍有边界**（平台行为，不可改）。凡是改「创建期」配置的发布说明，都必须写清「要么升级、要么手工 `--force-recreate`，光重启无效」。
 
 ---
 

@@ -172,6 +172,12 @@ curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<控制台端口>/app/rus
 > 排查顺序：**① 容器在不在 → ② 是不是这个 socket 冲突 → ③ 才去看 `gateway.conf` 和入口 `url`**，
 > 这条故障里配置本来就是对的，先改配置只会白折腾。完整版见 `docs/pitfalls.md` 的 **P21**。
 
+> **如果是「升级之后」才打不开，且 `docker logs rustfs-fnos-gateway` 里满屏 `sh: out of range`**：
+> 那不是 socket 问题，是 compose 把 gateway 启动脚本里的 `$变量` 插值成了空串（`grep -qF ""` 空模式匹配一切 → 死循环 → 502）。
+> 判据只有一条可信：`sudo docker inspect -f '{{json .Config.Cmd}}' rustfs-fnos-gateway`，看到 `""` 或 `grep -qF ""` 就是它。
+> 处理：升级到 **`1.0.4-4`**（`1.0.4-3` 已作废、从未对外发布）；**光「重启应用」没用**——`stop/start` 不会重建容器，必须 `docker compose … up -d --force-recreate`。
+> 完整说明见 `docs/pitfalls.md` 的 **P22**（含「stop/start 不重建容器」这条附注）。
+
 ### ② 窗口能打开，但登录一直失败
 
 **正常情况下你不需要填任何东西** —— 从 v17 起，窗口内打开时页面会**自动**把正确的服务器地址写进浏览器，直接输账号密码即可。
